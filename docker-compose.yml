@@ -1,0 +1,412 @@
+services:
+  # PostgreSQL for user data
+  # NOTE: When using AWS RDS (ENVIRONMENT=production or AWS config in .env),
+  # this local postgres container is NOT used. Configure POSTGRES_HOST in .env
+  # to point to AWS RDS: smart-tutor-postgres.cmfouoe8c2p1.us-east-1.rds.amazonaws.com
+  postgres:
+    image: postgres:15-alpine
+    container_name: smart-tutor-postgres
+    environment:
+      POSTGRES_DB: smart_tutor
+      POSTGRES_USER: smart_tutor_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    # SECURITY: Only expose port in development
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT_EXPOSE:-5432}:5432"  # Loopback-only; override port for local access
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smart_tutor_user -d smart_tutor"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - smart-tutor-network
+    # SECURITY: Add security options
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    restart: unless-stopped
+    # OPTIONAL: Uncomment "profiles" to prevent this from starting by default
+    # profiles:
+    #   - local-dev-only
+
+  # DynamoDB Local for chat sessions
+  # NOTE: When using AWS DynamoDB (DYNAMODB_ENDPOINT is empty in .env),
+  # this local dynamodb container is NOT used. AWS DynamoDB in us-east-1 is used instead.
+  dynamodb-local:
+    image: amazon/dynamodb-local:2.5.3
+    container_name: smart-tutor-dynamodb
+    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath /data"
+    # SECURITY: Bind to loopback only — no auth on DynamoDB Local
+    ports:
+      - "127.0.0.1:8001:8000"
+    working_dir: /home/dynamodblocal
+    volumes:
+      - dynamodb_data:/data
+    networks:
+      - smart-tutor-network
+    restart: unless-stopped
+    # OPTIONAL: Uncomment "profiles" to prevent this from starting by default
+    # profiles:
+    #   - local-dev-only
+
+  # Redis for caching (Phase 3)
+  redis:
+    image: redis:7-alpine
+    container_name: smart-tutor-redis
+    # SECURITY: Bind to loopback only for development access
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - redis_data:/data
+    # SECURITY: Require password for Redis access
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - smart-tutor-network
+    restart: unless-stopped
+
+  # Neo4j Knowledge Graph for Agent System
+  neo4j:
+    image: neo4j:2025-community
+    container_name: smart-tutor-neo4j
+    ports:
+      - "127.0.0.1:7474:7474"   # HTTP browser (loopback only)
+      - "127.0.0.1:7687:7687"   # Bolt protocol (loopback only)
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_initial_dbms_default__database=smarttutor
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env}", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - smart-tutor-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Backend API service
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: smart-tutor-backend
+    # Docker rejects driver-specific options at container start, so the base
+    # compose file only carries options valid for the default json-file
+    # driver (`tag`). Production uses raw `docker run` in deploy-production.yml
+    # with explicit --log-driver=awslogs and the awslogs-* opts — not this
+    # compose file. To run an awslogs-backed stack locally, create a
+    # docker-compose.override.yml that re-declares the `logging:` block.
+    logging:
+      driver: "${BACKEND_LOG_DRIVER:-json-file}"
+      options:
+        tag: "smart-tutor-backend"
+    ports:
+      - "127.0.0.1:${BACKEND_PORT_EXPOSE:-8010}:8000"
+    env_file:
+      - .env
+    environment:
+      # Override with .env file settings (uses AWS RDS + DynamoDB in production mode)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+      - HF_HOME=/app/.cache
+      - TRANSFORMERS_CACHE=/app/.cache/huggingface
+      - OLLAMA_HOST=http://ollama:11434
+      # SECURITY: Code execution disabled by default — enable only in isolated sandbox
+      - ENABLE_CODE_EXECUTION=false
+      # NEO4J_URI comes from .env (pointing to Neo4j Desktop via host.docker.internal)
+      # For local development, uncomment these:
+      # - POSTGRES_HOST=postgres
+      # - POSTGRES_PORT=5432
+      # - DYNAMODB_ENDPOINT=http://dynamodb-local:8000
+      # - ENVIRONMENT=development
+      # - DEBUG=true
+    depends_on:
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+      # neo4j: Using Neo4j Desktop on host (not Docker container)
+      # NOTE: When using AWS RDS + DynamoDB (current production config),
+      # postgres and dynamodb-local dependencies are NOT needed.
+      # Uncomment these ONLY for local-only development (without AWS):
+      # postgres:
+      #   condition: service_healthy
+      # dynamodb-local:
+      #   condition: service_started
+    volumes:
+      - ./user_data:/app/user_data
+      - ./logs:/app/logs
+      - ./keys:/app/keys
+      - ./persisted_index:/app/persisted_index
+      - ./chroma_db:/app/chroma_db
+      - ./previous_chats:/app/previous_chats
+      - ./quiz_results:/app/quiz_results
+      - ./data:/app/data
+      - ./Evaluation_files:/app/Evaluation_files
+    networks:
+      - smart-tutor-network
+    restart: unless-stopped
+    # SECURITY: Add security hardening
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+
+  # Frontend Next.js service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_BASE_URL=/api/backend
+        - BACKEND_API_BASE_URL=http://backend:8000
+        - NEXT_PUBLIC_APP_BASE_URL=${NEXT_PUBLIC_APP_BASE_URL:-http://localhost:4000}
+        # SECURITY: OAuth credentials from .env — never hardcode in compose
+        - NEXT_PUBLIC_GOOGLE_CLIENT_ID=${NEXT_PUBLIC_GOOGLE_CLIENT_ID:-}
+        - NEXT_PUBLIC_GOOGLE_REDIRECT_URI=${NEXT_PUBLIC_GOOGLE_REDIRECT_URI:-http://localhost:4000/auth/google/callback}
+    container_name: smart-tutor-frontend
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT_EXPOSE:-4000}:4000"
+    environment:
+      - NEXT_PUBLIC_API_BASE_URL=/api/backend
+      - BACKEND_API_BASE_URL=http://backend:8000
+      - NEXT_PUBLIC_APP_BASE_URL=${NEXT_PUBLIC_APP_BASE_URL:-http://localhost:4000}
+      - NODE_ENV=production
+    depends_on:
+      - backend
+    networks:
+      - smart-tutor-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4000/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: smart-tutor-prometheus
+    # SECURITY: Bind to loopback — access via Grafana internally
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      # SECURITY: Removed --web.enable-lifecycle (exposes /-/quit without auth)
+      - '--storage.tsdb.retention.time=30d'
+    networks:
+      - smart-tutor-network
+    restart: unless-stopped
+
+  # Grafana for metrics visualization
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: smart-tutor-grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT_EXPOSE:-3001}:3000"
+    environment:
+      # SECURITY: Use environment variable for admin password
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=${GRAFANA_ROOT_URL:-http://localhost:3001}
+      - GF_INSTALL_PLUGINS=redis-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - smart-tutor-network
+    restart: unless-stopped
+    # SECURITY: Add security options
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # Postgres Exporter for database metrics
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: smart-tutor-postgres-exporter
+    ports:
+      - "127.0.0.1:9187:9187"
+    environment:
+      # SECURITY: Use environment variable for database password
+      DATA_SOURCE_NAME: "postgresql://smart_tutor_user:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/smart_tutor?sslmode=disable"
+    depends_on:
+      - postgres
+    networks:
+      - smart-tutor-network
+    restart: unless-stopped
+    # SECURITY: Add security options
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256M
+
+  # Redis Exporter for cache metrics
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.67.0
+    container_name: smart-tutor-redis-exporter
+    ports:
+      - "127.0.0.1:9121:9121"
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    depends_on:
+      - redis
+    networks:
+      - smart-tutor-network
+    restart: unless-stopped
+
+  # Node Exporter for system metrics
+  # Note: Limited functionality on macOS Docker Desktop (no host filesystem access)
+  node-exporter:
+    image: prom/node-exporter:v1.9.0
+    container_name: smart-tutor-node-exporter
+    ports:
+      - "127.0.0.1:9100:9100"
+    command:
+      - '--collector.disable-defaults'
+      - '--collector.cpu'
+      - '--collector.meminfo'
+      - '--collector.loadavg'
+      - '--collector.filesystem'
+      - '--collector.netdev'
+    networks:
+      - smart-tutor-network
+    restart: unless-stopped
+    # SECURITY: Add security options
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 128M
+
+  # Ollama for Code LLM (Qwen2.5 Coder)
+  ollama:
+    image: ollama/ollama:0.6.2
+    container_name: smart-tutor-ollama
+    # SECURITY: Bind to loopback — no auth on Ollama API
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_HOST=0.0.0.0:11434
+    networks:
+      - smart-tutor-network
+    restart: unless-stopped
+    healthcheck:
+      # /api/tags returns {"models":[...]} with HTTP 200 only when Ollama is fully ready.
+      # The root "/" endpoint returns plain text and is less reliable for health checks.
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+  # Nginx reverse proxy for TLS termination (opt-in)
+  # Usage: docker compose --profile tls up -d nginx
+  # Requires: TLS certs mounted at ./certs/fullchain.pem and ./certs/privkey.pem
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: smart-tutor-nginx
+    profiles:
+      - tls
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - smart-tutor-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+networks:
+  smart-tutor-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  dynamodb_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  ollama_data:
+  neo4j_data:
+  neo4j_logs:

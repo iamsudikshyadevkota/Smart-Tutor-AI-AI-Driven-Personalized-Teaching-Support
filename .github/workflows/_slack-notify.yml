@@ -1,0 +1,152 @@
+name: Slack Notify
+
+# Thin reusable wrapper around the .github/actions/send-slack-notification
+# composite action. The composite action is the source of truth for payload
+# formatting, retries, dedup, etc. This workflow just exists so callers can
+# `uses: ./.github/workflows/_slack-notify.yml` and pick a *named* channel
+# (instead of having to plumb the webhook secret through themselves).
+#
+# Direct callers that already have the webhook in hand should prefer the
+# composite action — it runs in the same job (no extra runner).
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: "Logical channel name — SMART_TUTOR_AI or APP_DEV_ANALYTICS"
+        required: true
+        type: string
+      workflow_name:
+        description: "Display name shown in Slack notification header"
+        required: true
+        type: string
+      status:
+        description: "success | failure | warning | cancelled | skipped | timed_out | neutral"
+        required: true
+        type: string
+      message:
+        description: "Main notification body in Slack mrkdwn format"
+        required: true
+        type: string
+      fields:
+        description: "JSON array of {title, value, short} for fields sections (>20 entries are paged across multiple sections)"
+        required: false
+        type: string
+        default: "[]"
+      run_url:
+        description: "Link back to the GitHub Actions run"
+        required: false
+        type: string
+        default: ""
+      actor:
+        description: "GitHub user who triggered the workflow"
+        required: false
+        type: string
+        default: ""
+      verbiage:
+        description: "Short label for the event type (defaults to workflow_name)"
+        required: false
+        type: string
+        default: ""
+      dedup_key:
+        description: "Optional stable id; repeats with same (dedup_key, status) within dedup_window_minutes are suppressed"
+        required: false
+        type: string
+        default: ""
+      dedup_window_minutes:
+        description: "Suppression window in minutes when dedup_key is set"
+        required: false
+        type: number
+        default: 60
+      dry_run:
+        description: "Build the payload but skip the POST (for testing)"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      SLACK_WEBHOOK_URL_SMART_TUTOR_AI:
+        description: "Slack webhook URL for #smart-tutor-ai"
+        required: false
+      SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS:
+        description: "Slack webhook URL for #app-development-analytics"
+        required: false
+    outputs:
+      sent:
+        description: "true if the notification was posted, false if skipped/deduplicated/dry-run"
+        value: ${{ jobs.notify.outputs.sent }}
+      http_status:
+        description: "Slack HTTP status code, or 'deduped' if suppressed"
+        value: ${{ jobs.notify.outputs.http_status }}
+
+jobs:
+  notify:
+    name: Send Slack Notification
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sent: ${{ steps.notify.outputs.sent }}
+      http_status: ${{ steps.notify.outputs.http_status }}
+    steps:
+      - name: Checkout repo (for the composite action)
+        uses: actions/checkout@v4
+        with:
+          # We only need the action.yml file from this repo, not history.
+          fetch-depth: 1
+
+      - name: Resolve webhook for channel
+        id: resolve
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          WEBHOOK_SMART_TUTOR: ${{ secrets.SLACK_WEBHOOK_URL_SMART_TUTOR_AI }}
+          WEBHOOK_APP_DEV: ${{ secrets.SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS }}
+        run: |
+          set -euo pipefail
+          case "${CHANNEL}" in
+            SMART_TUTOR_AI)
+              webhook="${WEBHOOK_SMART_TUTOR}" ;;
+            APP_DEV_ANALYTICS)
+              webhook="${WEBHOOK_APP_DEV}" ;;
+            *)
+              echo "::warning::Unknown channel '${CHANNEL}'; supported: SMART_TUTOR_AI, APP_DEV_ANALYTICS."
+              webhook="" ;;
+          esac
+          # Don't echo the webhook itself; the composite action masks it.
+          if [ -n "${webhook}" ]; then
+            echo "has_webhook=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_webhook=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Pass the value through a GITHUB_OUTPUT line marked sensitive via add-mask.
+          echo "::add-mask::${webhook}"
+          {
+            echo "webhook<<__SLACK_EOF__"
+            echo "${webhook}"
+            echo "__SLACK_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send Slack notification
+        id: notify
+        if: steps.resolve.outputs.has_webhook == 'true'
+        uses: ./.github/actions/send-slack-notification
+        with:
+          webhook_url: ${{ steps.resolve.outputs.webhook }}
+          workflow_name: ${{ inputs.workflow_name }}
+          status: ${{ inputs.status }}
+          message: ${{ inputs.message }}
+          fields: ${{ inputs.fields }}
+          run_url: ${{ inputs.run_url }}
+          actor: ${{ inputs.actor }}
+          verbiage: ${{ inputs.verbiage }}
+          dedup_key: ${{ inputs.dedup_key }}
+          dedup_window_minutes: ${{ inputs.dedup_window_minutes }}
+          dry_run: ${{ inputs.dry_run }}
+
+      - name: Note when webhook is unset
+        if: steps.resolve.outputs.has_webhook != 'true'
+        env:
+          # Interpolating ${{ inputs.channel }} directly into the run script
+          # would let a caller smuggle shell via the channel string. Route it
+          # through env: so the shell sees an inert variable.
+          CHANNEL_INPUT: ${{ inputs.channel }}
+        run: |
+          echo "::warning::No webhook configured for channel '${CHANNEL_INPUT}'. Skipping send."

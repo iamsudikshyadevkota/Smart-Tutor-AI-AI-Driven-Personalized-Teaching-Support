@@ -1,0 +1,170 @@
+name: Database Migrations
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment_name:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      git_ref:
+        description: Git ref to use for migration code
+        required: true
+        default: main
+      strategy:
+        description: Migration strategy
+        required: true
+        type: choice
+        default: alembic
+        options:
+          - alembic
+          - auto
+          - schema-init
+
+concurrency:
+  group: database-migrations-${{ inputs.environment_name }}
+  cancel-in-progress: false
+
+jobs:
+  run-migrations:
+    name: Run Database Migrations
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment_name }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+      POSTGRES_PORT: ${{ secrets.POSTGRES_PORT }}
+      POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+      POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 1
+
+      - name: Validate database secrets
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for name in POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing required database migration secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir -r backend/requirements.txt
+
+      - name: Resolve migration strategy
+        id: strategy
+        env:
+          SECRETS_PROVIDER: env
+          REQUESTED_STRATEGY: ${{ inputs.strategy }}
+        run: |
+          set -euo pipefail
+
+          requested="${REQUESTED_STRATEGY}"
+          if [ "$requested" = "auto" ]; then
+            if [ -f alembic.ini ] || [ -f backend/alembic.ini ]; then
+              resolved="alembic"
+            else
+              resolved="schema-init"
+            fi
+          else
+            resolved="$requested"
+          fi
+
+          if [ "$resolved" = "alembic" ] && [ ! -f alembic.ini ] && [ ! -f backend/alembic.ini ]; then
+            echo "::error::Alembic strategy requested, but no alembic.ini was found in the repository."
+            exit 1
+          fi
+
+          echo "resolved=${resolved}" >> "$GITHUB_OUTPUT"
+
+      - name: Build database URL
+        id: db-url
+        env:
+          SECRETS_PROVIDER: env
+        run: |
+          set -euo pipefail
+          python3 -c "
+          import os
+          from urllib.parse import quote
+          host   = os.environ['POSTGRES_HOST']
+          port   = os.environ['POSTGRES_PORT']
+          db     = os.environ['POSTGRES_DB']
+          user   = os.environ['POSTGRES_USER']
+          passwd = os.environ['POSTGRES_PASSWORD']
+          sslmode = os.environ.get('POSTGRES_SSL_MODE', 'require')
+          url = 'postgresql+psycopg2://' + user + ':' + quote(passwd, safe='') + '@' + host + ':' + port + '/' + db + '?sslmode=' + sslmode
+          with open('/tmp/db_url.txt', 'w') as f:
+              f.write(url)
+          "
+          echo "db_url=$(cat /tmp/db_url.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Run Alembic migrations
+        if: ${{ steps.strategy.outputs.resolved == 'alembic' }}
+        env:
+          ALEMBIC_DB_URL: ${{ steps.db-url.outputs.db_url }}
+          SECRETS_PROVIDER: env
+        run: |
+          set -euo pipefail
+          # ALEMBIC_DB_URL is read by backend/alembic/env.py to bypass
+          # ConfigParser which corrupts passwords containing % chars
+          python -m alembic -c alembic.ini upgrade head
+
+      - name: Run legacy schema initializer
+        if: ${{ steps.strategy.outputs.resolved == 'schema-init' }}
+        env:
+          ENVIRONMENT: ${{ inputs.environment_name }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python -m backend.services.storage.init_postgres
+
+      - name: Migration summary
+        if: always()
+        env:
+          SUMMARY_ENVIRONMENT: ${{ inputs.environment_name }}
+          SUMMARY_GIT_REF: ${{ inputs.git_ref }}
+          SUMMARY_REQUESTED_STRATEGY: ${{ inputs.strategy }}
+          SUMMARY_RESOLVED_STRATEGY: ${{ steps.strategy.outputs.resolved }}
+        run: |
+          {
+            echo "## Database Migration Summary"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Environment | \`${SUMMARY_ENVIRONMENT}\` |"
+            echo "| Git ref | \`${SUMMARY_GIT_REF}\` |"
+            echo "| Requested strategy | \`${SUMMARY_REQUESTED_STRATEGY}\` |"
+            echo "| Resolved strategy | \`${SUMMARY_RESOLVED_STRATEGY}\` |"
+            echo ""
+            echo "Notes:"
+            echo "- Database connection details are intentionally omitted from this summary because they come from masked environment secrets."
+            echo "- \`alembic\` is the default and runs \`alembic -c alembic.ini upgrade head\`."
+            echo "- \`schema-init\` is the legacy fallback and now delegates to Alembic migrations."
+          } >> "$GITHUB_STEP_SUMMARY"

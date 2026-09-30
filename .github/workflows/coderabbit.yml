@@ -1,0 +1,340 @@
+name: CodeRabbit AI Review
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review (for workflow_dispatch runs)"
+        required: false
+        type: string
+
+concurrency:
+  group: coderabbit-review-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  PR_TITLE: ${{ github.event.pull_request.title }}
+  PR_BODY: ${{ github.event.pull_request.body }}
+  PR_NUMBER: ${{ github.event.pull_request.number || '0' }}
+  BASE_REF: ${{ github.event.pull_request.base.ref }}
+  HEAD_REF: ${{ github.event.pull_request.head.ref }}
+
+jobs:
+  review:
+    name: AI Code Review
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request' || inputs.pr_number != '' }}
+    outputs:
+      action: ${{ steps.post_comment.outputs.action || 'skipped' }}
+      comment_url: ${{ steps.post_comment.outputs.comment_url || '' }}
+      affected: ${{ steps.changed_areas.outputs.affected }}
+      pr_number: ${{ steps.pr_meta.outputs.pr_number }}
+      base_ref: ${{ steps.pr_meta.outputs.base_ref }}
+      head_ref: ${{ steps.pr_meta.outputs.head_ref }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve PR metadata
+        id: pr_meta
+        env:
+          PR_NUMBER_INPUT: ${{ github.event.pull_request.number || inputs.pr_number || '0' }}
+          BASE_REF_INPUT: ${{ github.event.pull_request.base.ref || '' }}
+          HEAD_REF_INPUT: ${{ github.event.pull_request.head.ref || '' }}
+        run: |
+          echo "pr_number=${PR_NUMBER_INPUT}" >> "$GITHUB_OUTPUT"
+          echo "base_ref=${BASE_REF_INPUT}" >> "$GITHUB_OUTPUT"
+          echo "head_ref=${HEAD_REF_INPUT}" >> "$GITHUB_OUTPUT"
+
+      - name: Get PR diff
+        id: diff
+        env:
+          PR_NUM: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/review
+          if [ -n "${PR_NUM}" ] && [ "${PR_NUM}" != "0" ]; then
+            gh pr diff "${PR_NUM}" > /tmp/review/pr.diff || echo "" > /tmp/review/pr.diff
+          else
+            echo "" > /tmp/review/pr.diff
+          fi
+          diff_lines=$(wc -l < /tmp/review/pr.diff | tr -d ' ')
+          echo "diff_lines=${diff_lines}" >> "$GITHUB_OUTPUT"
+
+      - name: Identify changed areas
+        id: changed_areas
+        env:
+          PR_NUM: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          affected=""
+          if [ -n "${PR_NUM}" ] && [ "${PR_NUM}" != "0" ]; then
+            for f in $(gh pr diff "${PR_NUM}" --name-only 2>/dev/null | head -100); do
+              case "$f" in
+                backend/*) affected="${affected}backend " ;;
+                frontend/*) affected="${affected}frontend " ;;
+                scripts/*) affected="${affected}scripts " ;;
+                .github/*) affected="${affected}ci " ;;
+                *.yml|*.yaml) affected="${affected}ci " ;;
+              esac
+            done
+          fi
+          uniq_packages=$(echo "${affected}" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+          echo "affected=${uniq_packages:-all}" >> "$GITHUB_OUTPUT"
+
+      - name: Scan for hardcoded secrets
+        id: secret_scan
+        run: |
+          set -euo pipefail
+          secrets_found=""
+          if [ -f /tmp/review/pr.diff ]; then
+            secrets_found=$(grep -nE '(password|secret|token|api.?key|private.?key)\s*=\s*["\x27][^"\x27]{8,}["\x27]' /tmp/review/pr.diff 2>/dev/null | head -20 || true)
+          fi
+          echo "secrets<<EOF" >> "$GITHUB_OUTPUT"
+          echo "${secrets_found:-none}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Build review report
+        id: build_report
+        env:
+          AFFECTED: ${{ steps.changed_areas.outputs.affected }}
+          SECRETS_SCAN: ${{ steps.secret_scan.outputs.secrets }}
+        run: |
+          set -euo pipefail
+
+          high_priority=""
+          if [ "${SECRETS_SCAN}" != "none" ] && [ -n "${SECRETS_SCAN}" ]; then
+            high_priority="### 🔴 Critical: Hardcoded Secrets Detected in Diff
+
+            \`\`\`
+            ${SECRETS_SCAN}
+            \`\`\`
+
+            "
+          fi
+
+          backend_issues=""
+          frontend_issues=""
+
+          if [ -d backend ]; then
+            for f in $(find backend -name "*.py" -type f 2>/dev/null | head -30); do
+              fname=$(basename "$f")
+              if grep -qE 'except\s*:' "$f" 2>/dev/null; then
+                backend_issues="${backend_issues}- \`${fname}\`: bare \`except:\` — silently swallows all exceptions
+                "
+              fi
+              if grep -qE 'eval\s*\(' "$f" 2>/dev/null; then
+                backend_issues="${backend_issues}- \`${fname}\`: \`eval()\` — potential code injection
+                "
+              fi
+              if grep -qE 'pickle\.loads' "$f" 2>/dev/null; then
+                backend_issues="${backend_issues}- \`${fname}\`: unpickling untrusted data — CVE risk
+                "
+              fi
+            done
+          fi
+
+          if [ -d frontend/src ]; then
+            for f in $(find frontend/src -name "*.tsx" -o -name "*.ts" -type f 2>/dev/null | head -30); do
+              fname=$(basename "$f")
+              if grep -qE '\.innerHTML\s*=' "$f" 2>/dev/null; then
+                frontend_issues="${frontend_issues}- \`${fname}\`: \`.innerHTML =\` — XSS risk, use textContent or sanitise
+                "
+              fi
+              if grep -qE 'eval\s*\(' "$f" 2>/dev/null; then
+                frontend_issues="${frontend_issues}- \`${fname}\`: \`eval()\` — potential code injection
+                "
+              fi
+            done
+          fi
+
+          pr_description=""
+          if [ -n "${PR_BODY}" ]; then
+            pr_description="
+
+            ## Description
+
+            ${PR_BODY}"
+          fi
+
+          cat > /tmp/review/report.md <<REVIEW_EOF
+          # AI Code Review Report
+
+          ## Pull Request
+
+          | Field | Value |
+          |-------|-------|
+          | **Title** | ${PR_TITLE} |
+          | **Base branch** | ${BASE_REF} |
+          | **Head branch** | ${HEAD_REF} |
+          | **Affected areas** | ${AFFECTED}${pr_description}
+
+          ---
+
+          ## Review Scope
+
+          This automated review checks for:
+          - **Security**: hardcoded secrets, SQL injection, XSS, broken auth, eval usage
+          - **Performance**: N+1 queries, inefficient loops, missing pagination, memory issues
+          - **Code quality**: bare except clauses, missing error handling, antipatterns
+          - **Best practices**: logging, observability, proper error messages, type safety
+
+          ---
+
+          ${high_priority}
+          $([ -n "${backend_issues}" ] && echo "### Backend Issues
+
+          ${backend_issues}" || true)
+          $([ -n "${frontend_issues}" ] && echo "### Frontend Issues
+
+          ${frontend_issues}" || true)
+
+          _Generated by Smart AI Tutor code review workflow_
+          REVIEW_EOF
+
+          echo "report<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/review/report.md >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Post review comment
+        id: post_comment
+        if: ${{ steps.pr_meta.outputs.pr_number != '0' }}
+        env:
+          PR_NUMBER: ${{ steps.pr_meta.outputs.pr_number }}
+          REPORT_CONTENT: ${{ steps.build_report.outputs.report }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNum = process.env.PR_NUMBER;
+            const reportContent = process.env.REPORT_CONTENT;
+
+            const existing = (await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt(prNum),
+            })).data.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('AI Code Review Report')
+            );
+
+            if (existing) {
+              const { data: updated } = await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: reportContent,
+              });
+              core.setOutput('comment_url', updated.html_url);
+              core.setOutput('action', 'updated');
+            } else {
+              const { data: created } = await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: parseInt(prNum),
+                body: reportContent,
+              });
+              core.setOutput('comment_url', created.html_url);
+              core.setOutput('action', 'created');
+            }
+
+      - name: Upload diff artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coderabbit-pr-diff-${{ steps.pr_meta.outputs.pr_number }}
+          path: /tmp/review/pr.diff
+          retention-days: 1
+
+      - name: Review summary
+        if: always()
+        env:
+          PR_NUMBER: ${{ steps.pr_meta.outputs.pr_number }}
+          AFFECTED: ${{ steps.changed_areas.outputs.affected }}
+          REVIEW_ACTION: ${{ steps.post_comment.outputs.action }}
+          REVIEW_COMMENT_URL: ${{ steps.post_comment.outputs.comment_url }}
+        run: |
+          action="${REVIEW_ACTION:-skipped}"
+          comment_url="${REVIEW_COMMENT_URL:-n/a}"
+
+          {
+            echo "## CodeRabbit AI Review"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| PR | #${PR_NUMBER} |"
+            echo "| Affected areas | \`${AFFECTED}\` |"
+            echo "| Action | \`${action}\` |"
+            echo "| Comment | ${comment_url} |"
+            echo "| Trigger | \`${{ github.event_name }}\` |"
+            echo ""
+            if [ "${action}" = "created" ] || [ "${action}" = "updated" ]; then
+              echo "✅ AI review posted to the PR."
+            else
+              echo "⚠️  Review skipped — no PR number available or PR not found."
+            fi
+            echo ""
+            echo "Note: For deeper line-by-line AI reviews, install the [CodeRabbit GitHub App](https://coderabbit.ai)"
+            echo "which provides real-time AI analysis on every PR push without workflow configuration."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify-pr-review-smart-tutor-ai:
+    name: Notify PR Review Posted (#smart-tutor-ai)
+    needs: [review]
+    if: always()
+    uses: ./.github/workflows/_slack-notify.yml
+    secrets:
+      SLACK_WEBHOOK_URL_SMART_TUTOR_AI: ${{ secrets.SLACK_WEBHOOK_URL_SMART_TUTOR_AI }}
+      SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS: ${{ secrets.SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS }}
+    with:
+      channel: SMART_TUTOR_AI
+      workflow_name: CodeRabbit AI Review
+      status: ${{ needs.review.result == 'failure' && 'failure' || 'success' }}
+      verbiage: AI Review
+      message: |
+        :white_check_mark: *AI code review posted to PR #${{ needs.review.outputs.pr_number || '0' }}*
+        Action: *${{ needs.review.outputs.action || 'skipped' }}* | Areas: *${{ needs.review.outputs.affected || 'all' }}*
+        ${{ needs.review.outputs.comment_url != '' && format('<{0}|View review comment>', needs.review.outputs.comment_url) || '' }}
+      fields: >-
+        [
+          {"title": "PR", "value": "#${{ needs.review.outputs.pr_number || '0' }}", "short": true},
+          {"title": "Base", "value": "${{ needs.review.outputs.base_ref || 'n/a' }}", "short": true},
+          {"title": "Head", "value": "${{ needs.review.outputs.head_ref || 'n/a' }}", "short": true},
+          {"title": "Affected Areas", "value": "${{ needs.review.outputs.affected || 'all' }}", "short": true},
+          {"title": "Action", "value": "${{ needs.review.outputs.action || 'skipped' }}", "short": true},
+          {"title": "Comment", "value": "${{ needs.review.outputs.comment_url != '' && format('<{0}|View in GitHub>', needs.review.outputs.comment_url) || 'n/a' }}", "short": false}
+        ]
+
+  notify-pr-review-app-development-analytics:
+    name: Notify PR Review Posted (#app-development-analytics)
+    needs: [review]
+    if: always()
+    uses: ./.github/workflows/_slack-notify.yml
+    secrets:
+      SLACK_WEBHOOK_URL_SMART_TUTOR_AI: ${{ secrets.SLACK_WEBHOOK_URL_SMART_TUTOR_AI }}
+      SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS: ${{ secrets.SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS }}
+    with:
+      channel: APP_DEV_ANALYTICS
+      workflow_name: CodeRabbit AI Review
+      status: ${{ needs.review.result == 'failure' && 'failure' || 'success' }}
+      verbiage: AI Review
+      message: |
+        :white_check_mark: *AI code review posted to PR #${{ needs.review.outputs.pr_number || '0' }}*
+        Action: *${{ needs.review.outputs.action || 'skipped' }}* | Areas: *${{ needs.review.outputs.affected || 'all' }}*
+        ${{ needs.review.outputs.comment_url != '' && format('<{0}|View review comment>', needs.review.outputs.comment_url) || '' }}
+      fields: >-
+        [
+          {"title": "PR", "value": "#${{ needs.review.outputs.pr_number || '0' }}", "short": true},
+          {"title": "Base", "value": "${{ needs.review.outputs.base_ref || 'n/a' }}", "short": true},
+          {"title": "Head", "value": "${{ needs.review.outputs.head_ref || 'n/a' }}", "short": true},
+          {"title": "Affected Areas", "value": "${{ needs.review.outputs.affected || 'all' }}", "short": true},
+          {"title": "Action", "value": "${{ needs.review.outputs.action || 'skipped' }}", "short": true},
+          {"title": "Comment", "value": "${{ needs.review.outputs.comment_url != '' && format('<{0}|View in GitHub>', needs.review.outputs.comment_url) || 'n/a' }}", "short": false}
+        ]

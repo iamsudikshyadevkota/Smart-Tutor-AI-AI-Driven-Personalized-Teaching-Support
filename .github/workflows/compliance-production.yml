@@ -1,0 +1,420 @@
+name: Production Compliance Scan
+
+on:
+  schedule:
+    # Monday 16:30 UTC — inside the Mon-Fri 09:00-17:00 America/Chicago
+    # maintenance window (see ec2-schedule.yml) either side of DST (11:30 AM
+    # CDT / 10:30 AM CST). Previously ran at 08:00 UTC (3 AM Central),
+    # always outside the window, so the EC2 host checks always skipped.
+    - cron: "30 16 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: production-compliance-scan
+  cancel-in-progress: false
+
+jobs:
+  compliance-scan:
+    name: EC2 Compliance Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      skipped_reason: ${{ steps.remote-checks.outputs.skipped_reason }}
+    env:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID || vars.EC2_INSTANCE_ID || '' }}
+      EC2_INSTANCE_NAME: ${{ vars.EC2_INSTANCE_NAME || '' }}
+      EC2_AUTO_START: ${{ vars.EC2_AUTO_START || 'true' }}
+      EC2_TEMPORARY_SSH_INGRESS: ${{ vars.EC2_TEMPORARY_SSH_INGRESS || 'true' }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+      EC2_APP_DIR: ${{ vars.EC2_APP_DIR || '' }}
+      COMPLIANCE_REQUIRE_EC2_SSH: ${{ vars.COMPLIANCE_REQUIRE_EC2_SSH || 'false' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in EC2_USER EC2_SSH_KEY; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ -z "${EC2_HOST:-}" ] && [ -z "${EC2_INSTANCE_ID:-}" ] && [ -z "${EC2_INSTANCE_NAME:-}" ]; then
+            missing+=("EC2_HOST or EC2_INSTANCE_ID/EC2_INSTANCE_NAME")
+          fi
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required production compliance configuration."
+            for item in "${missing[@]}"; do
+              echo "::error::Missing required secret ${item}"
+            done
+            exit 1
+          fi
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "::warning::AWS inventory credentials are not configured. AWS account snapshot steps will be skipped."
+          fi
+
+      - name: Install AWS CLI
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' && env.AWS_SECRET_ACCESS_KEY != '' }}
+        uses: unfor19/install-aws-cli-action@e8b481e524a99f37fbd39fdc1dcb3341ab091367  # v1.0.7
+
+      - name: Resolve production EC2 target
+        run: scripts/ci/resolve_ec2_target.sh
+
+      - name: Capture AWS compliance snapshot from runner
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' && env.AWS_SECRET_ACCESS_KEY != '' }}
+        run: |
+          set -uo pipefail
+          mkdir -p /tmp/compliance-report
+          mkdir -p /tmp/compliance-report/aws-fallback-needed
+
+          capture_snapshot() {
+            local name="$1"
+            local target="$2"
+            local empty_json="$3"
+            shift 3
+
+            if "$@" > "${target}"; then
+              echo "Captured ${name} from runner."
+            else
+              echo "${empty_json}" > "${target}"
+              touch "/tmp/compliance-report/aws-fallback-needed/${name}"
+              echo "::warning::Unable to capture ${name} from runner; EC2 fallback will be attempted."
+            fi
+          }
+
+          capture_snapshot "aws-identity" "/tmp/compliance-report/aws-identity.json" "{}" \
+            aws sts get-caller-identity
+          if [ -n "${EC2_RESOLVED_INSTANCE_ID:-}" ]; then
+            capture_snapshot "ec2-instance" "/tmp/compliance-report/ec2-instance.json" "[]" \
+              aws ec2 describe-instances \
+                --instance-ids "${EC2_RESOLVED_INSTANCE_ID}" \
+                --query 'Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,InstanceType:InstanceType,LaunchTime:LaunchTime,PublicIpAddress:PublicIpAddress,IMDSv2:MetadataOptions.HttpTokens,RootVolumeEncrypted:BlockDeviceMappings[0].Ebs.Encrypted,SecurityGroups:SecurityGroups[*].GroupId}' \
+                --output json
+          else
+            capture_snapshot "ec2-instance" "/tmp/compliance-report/ec2-instance.json" "[]" \
+              aws ec2 describe-instances \
+                --filters "Name=ip-address,Values=${EC2_HOST}" \
+                --query 'Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,InstanceType:InstanceType,LaunchTime:LaunchTime,PublicIpAddress:PublicIpAddress,IMDSv2:MetadataOptions.HttpTokens,RootVolumeEncrypted:BlockDeviceMappings[0].Ebs.Encrypted,SecurityGroups:SecurityGroups[*].GroupId}' \
+                --output json
+          fi
+
+      - name: Run remote EC2 compliance checks
+        id: remote-checks
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/compliance-report
+          key_file="$(mktemp)"
+          printf '%s\n' "${EC2_SSH_KEY}" > "${key_file}"
+          chmod 600 "${key_file}"
+          remote_app_dir="$(printf '%q' "${EC2_APP_DIR}")"
+          ssh_opts=(-o StrictHostKeyChecking=no -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=20 -o ConnectionAttempts=2 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o TCPKeepAlive=yes)
+
+          if ! ssh "${ssh_opts[@]}" -i "${key_file}" "${EC2_USER}@${EC2_HOST}" "printf 'ssh-ok\n'"; then
+            if [ "${{ github.event_name }}" = "schedule" ] && [ "$(printf '%s' "${COMPLIANCE_REQUIRE_EC2_SSH}" | tr '[:upper:]' '[:lower:]')" != "true" ]; then
+              echo "::warning::Production EC2 is not reachable over SSH from the GitHub runner. Skipping scheduled host compliance checks without failing the workflow."
+              echo "[INFO] Production EC2 SSH unavailable from GitHub runner; scheduled host checks skipped." > /tmp/compliance-report/ec2-host-checks.txt
+              echo "skipped_reason=ec2_ssh_unreachable" >> "$GITHUB_OUTPUT"
+              echo "EC2_SSH_REACHABLE=false" >> "$GITHUB_ENV"
+              rm -f "${key_file}"
+              exit 0
+            fi
+            echo "::error::Unable to reach production EC2 over SSH. Verify the resolved host, instance state, and security group ingress for GitHub-hosted runners on port 22."
+            exit 1
+          fi
+
+          ssh "${ssh_opts[@]}" -i "${key_file}" "${EC2_USER}@${EC2_HOST}" "EC2_APP_DIR=${remote_app_dir} bash -s" > /tmp/compliance-report/ec2-host-checks.txt <<'EOF'
+          set -euo pipefail
+
+          failures=0
+          check() {
+            local description="$1"
+            shift
+            if "$@"; then
+              echo "[PASS] ${description}"
+            else
+              echo "[FAIL] ${description}"
+              failures=$((failures + 1))
+            fi
+          }
+
+          timed() {
+            local seconds="$1"
+            shift
+            timeout "${seconds}" "$@"
+          }
+
+          retry_check() {
+            local attempts="$1"
+            local sleep_seconds="$2"
+            shift 2
+
+            local i
+            for i in $(seq 1 "${attempts}"); do
+              if "$@"; then
+                return 0
+              fi
+              if [ "${i}" -lt "${attempts}" ]; then
+                sleep "${sleep_seconds}"
+              fi
+            done
+
+            return 1
+          }
+
+          backend_health_status() {
+            docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' smart-tutor-backend 2>/dev/null
+          }
+
+          backend_ready_once() {
+            [ "$(backend_health_status)" = "healthy" ] \
+              || timed 25 curl -fsS --connect-timeout 3 --max-time 20 http://localhost:8010/ready >/dev/null \
+              || timed 30 docker exec smart-tutor-backend curl -fsS --connect-timeout 3 --max-time 15 http://127.0.0.1:8000/ready >/dev/null
+          }
+
+          backend_ready() {
+            retry_check 3 5 backend_ready_once
+          }
+
+          backend_health_once() {
+            timed 30 curl -fsS --connect-timeout 3 --max-time 20 http://localhost:8010/health >/dev/null \
+              || timed 35 docker exec smart-tutor-backend curl -fsS --connect-timeout 3 --max-time 15 http://127.0.0.1:8000/health >/dev/null
+          }
+
+          backend_health() {
+            retry_check 2 5 backend_health_once
+          }
+
+          APP_DIR="${EC2_APP_DIR:-}"
+          DATA_ROOT="/home/ubuntu/smart-tutor-data"
+
+          check "docker installed" timed 10 sh -c "command -v docker >/dev/null"
+          check "backend container running" timed 20 sh -c "docker ps --format '{{.Names}}' | grep -qx 'smart-tutor-backend'"
+          check "backend readiness endpoint responds" backend_ready
+          if backend_health; then
+            echo "[PASS] backend health endpoint responds"
+          else
+            echo "[INFO] backend health endpoint is unavailable or degraded"
+          fi
+          check "shared logs directory exists" timed 10 sh -c "test -d \"${DATA_ROOT}/logs\""
+          check "shared user data directory exists" timed 10 sh -c "test -d \"${DATA_ROOT}/user_data\""
+          check "shared chroma directory exists" timed 10 sh -c "test -d \"${DATA_ROOT}/chroma_db\""
+          check "backend restart policy is unless-stopped" timed 20 sh -c "[ \"$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' smart-tutor-backend)\" = 'unless-stopped' ]"
+          check "backend logs mount configured" timed 20 sh -c "docker inspect smart-tutor-backend | grep -q '/home/ubuntu/smart-tutor-data/logs'"
+          if [ -n "${APP_DIR}" ]; then
+            check "configured app directory exists" timed 10 sh -c "test -d \"${APP_DIR}\""
+          else
+            echo "[INFO] No EC2_APP_DIR configured; skipping repo-directory check."
+          fi
+
+          echo ""
+          echo "=== Running containers ==="
+          timed 20 docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' || true
+          echo ""
+          echo "=== Backend health status ==="
+          backend_health_status || true
+
+          if [ "${failures}" -gt 0 ]; then
+            exit 1
+          fi
+          EOF
+
+          rm -f "${key_file}"
+
+      - name: Capture AWS compliance snapshot from EC2 fallback
+        run: |
+          set -uo pipefail
+
+          if [ "${EC2_SSH_REACHABLE:-true}" = "false" ]; then
+            echo "::warning::Skipping EC2 fallback snapshot because SSH was not reachable."
+            exit 0
+          fi
+
+          mkdir -p /tmp/compliance-report
+          mkdir -p /tmp/compliance-report/aws-fallback-needed
+
+          needs_fallback=0
+          for name in aws-identity ec2-instance; do
+            if [ -f "/tmp/compliance-report/aws-fallback-needed/${name}" ]; then
+              needs_fallback=1
+            fi
+          done
+
+          if [ "${needs_fallback}" -eq 0 ] && \
+             [ -s /tmp/compliance-report/aws-identity.json ] && \
+             [ -s /tmp/compliance-report/ec2-instance.json ]; then
+            echo "Runner snapshot is complete; skipping EC2 fallback."
+            exit 0
+          fi
+
+          key_file="$(mktemp)"
+          printf '%s\n' "${EC2_SSH_KEY}" > "${key_file}"
+          chmod 600 "${key_file}"
+
+          capture_remote_snapshot() {
+            local name="$1"
+            local target="$2"
+            local empty_json="$3"
+            shift 3
+
+            if [ ! -f "/tmp/compliance-report/aws-fallback-needed/${name}" ] && [ -s "${target}" ]; then
+              return 0
+            fi
+
+            if ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=20 -o ConnectionAttempts=2 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o TCPKeepAlive=yes -i "${key_file}" "${EC2_USER}@${EC2_HOST}" "command -v aws >/dev/null 2>&1 && $*" > "${target}"; then
+              rm -f "/tmp/compliance-report/aws-fallback-needed/${name}"
+              echo "Captured ${name} from EC2 fallback."
+            else
+              echo "${empty_json}" > "${target}"
+              echo "::warning::Unable to capture ${name} from runner or EC2 host."
+            fi
+          }
+
+          capture_remote_snapshot "aws-identity" "/tmp/compliance-report/aws-identity.json" "{}" \
+            aws sts get-caller-identity
+          if [ -n "${EC2_RESOLVED_INSTANCE_ID:-}" ]; then
+            capture_remote_snapshot "ec2-instance" "/tmp/compliance-report/ec2-instance.json" "[]" \
+              aws ec2 describe-instances --instance-ids "${EC2_RESOLVED_INSTANCE_ID}" --query "'Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,InstanceType:InstanceType,LaunchTime:LaunchTime,PublicIpAddress:PublicIpAddress,IMDSv2:MetadataOptions.HttpTokens,RootVolumeEncrypted:BlockDeviceMappings[0].Ebs.Encrypted,SecurityGroups:SecurityGroups[*].GroupId}'" --output json
+          else
+            capture_remote_snapshot "ec2-instance" "/tmp/compliance-report/ec2-instance.json" "[]" \
+              aws ec2 describe-instances --filters "Name=ip-address,Values=${EC2_HOST}" --query "'Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,InstanceType:InstanceType,LaunchTime:LaunchTime,PublicIpAddress:PublicIpAddress,IMDSv2:MetadataOptions.HttpTokens,RootVolumeEncrypted:BlockDeviceMappings[0].Ebs.Encrypted,SecurityGroups:SecurityGroups[*].GroupId}'" --output json
+          fi
+
+          rm -f "${key_file}"
+
+      - name: Revoke temporary SSH ingress
+        if: always()
+        run: scripts/ci/revoke_ec2_ssh_ingress.sh
+
+      - name: Upload compliance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-compliance-report
+          path: /tmp/compliance-report/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Compliance summary
+        if: always()
+        run: |
+          set -euo pipefail
+
+          report_dir="/tmp/compliance-report"
+          host_report="${report_dir}/ec2-host-checks.txt"
+          pass_count=0
+          fail_count=0
+          info_count=0
+
+          if [ -f "${host_report}" ]; then
+            pass_count="$(grep -c '^\[PASS\]' "${host_report}" || true)"
+            fail_count="$(grep -c '^\[FAIL\]' "${host_report}" || true)"
+            info_count="$(grep -c '^\[INFO\]' "${host_report}" || true)"
+          fi
+
+          aws_identity_status="missing"
+          ec2_status="missing"
+
+          [ -s "${report_dir}/aws-identity.json" ] && aws_identity_status="captured"
+          [ -s "${report_dir}/ec2-instance.json" ] && ec2_status="captured"
+
+          {
+            echo "## Production Compliance Summary"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Workflow trigger | \`${{ github.event_name }}\` |"
+            echo "| Target host | \`${EC2_HOST}\` |"
+            echo "| EC2 app directory | \`${EC2_APP_DIR:-not configured (optional)}\` |"
+            echo "| Host checks report | \`${host_report}\` $([ -f "${host_report}" ] && echo 'found' || echo 'missing') |"
+            echo "| Passed checks | \`${pass_count}\` |"
+            echo "| Failed checks | \`${fail_count}\` |"
+            echo "| Informational checks | \`${info_count}\` |"
+            echo "| AWS identity snapshot | \`${aws_identity_status}\` |"
+            echo "| EC2 inventory snapshot | \`${ec2_status}\` |"
+            echo ""
+            echo "Artifacts:"
+            echo "- \`production-compliance-report\`"
+            echo "- Remote host checks plus runner/EC2 AWS inventory snapshots"
+            echo "- Repo-directory validation is skipped unless \`EC2_APP_DIR\` is configured"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify-compliance:
+    name: Notify Compliance Result
+    runs-on: ubuntu-latest
+    needs: [compliance-scan]
+    if: always()
+    permissions:
+      contents: read
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+    steps:
+      - name: Download compliance report artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: production-compliance-report
+          path: /tmp/compliance-report
+
+      - name: Resolve status and summary
+        id: vars
+        run: |
+          overall="${{ needs.compliance-scan.result }}"
+          pass_count="0"
+          fail_count="0"
+          info_count="0"
+          if [ -f /tmp/compliance-report/ec2-host-checks.txt ]; then
+            pass_count="$(grep -c '^\[PASS\]' /tmp/compliance-report/ec2-host-checks.txt || true)"
+            fail_count="$(grep -c '^\[FAIL\]' /tmp/compliance-report/ec2-host-checks.txt || true)"
+            info_count="$(grep -c '^\[INFO\]' /tmp/compliance-report/ec2-host-checks.txt || true)"
+          fi
+          echo "overall=${overall}" >> "$GITHUB_OUTPUT"
+          echo "pass_count=${pass_count}" >> "$GITHUB_OUTPUT"
+          echo "fail_count=${fail_count}" >> "$GITHUB_OUTPUT"
+          echo "info_count=${info_count}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout for Slack notify
+        uses: actions/checkout@v4
+
+      - name: Notify #smart-tutor-ai
+        uses: ./.github/actions/send-slack-notification
+        with:
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL_SMART_TUTOR_AI }}
+          workflow_name: Production Compliance Scan
+          status: ${{ needs.compliance-scan.outputs.skipped_reason != '' && 'warning' || (needs.compliance-scan.result == 'failure' && 'failure' || 'success') }}
+          verbiage: Compliance
+          message: |
+            ${{ needs.compliance-scan.outputs.skipped_reason != '' && ':warning: *Compliance scan skipped* — production EC2 was not reachable over SSH from the scheduled runner.' || (needs.compliance-scan.result == 'failure' && ':x: *Compliance scan FAILED* — failed checks detected on production host.' || ':white_check_mark: *Compliance scan completed* — host checks finished successfully.') }}
+            ${{ github.event_name == 'schedule' && 'Weekly scheduled scan.' || 'Manual dispatch.' }}
+          fields: >-
+            [
+              {"title": "Target Host", "value": "${{ secrets.EC2_HOST }}", "short": true},
+              {"title": "Pass / Fail / Info", "value": "${{ steps.vars.outputs.pass_count }} / ${{ steps.vars.outputs.fail_count }} / ${{ steps.vars.outputs.info_count }}", "short": true},
+              {"title": "Trigger", "value": "${{ github.event_name }}", "short": true},
+              {"title": "Result", "value": "${{ needs.compliance-scan.result }}", "short": true}
+            ]
+
+      - name: Notify #app-development-analytics
+        uses: ./.github/actions/send-slack-notification
+        with:
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS }}
+          workflow_name: Production Compliance Scan
+          status: ${{ needs.compliance-scan.result == 'failure' && 'failure' || 'success' }}
+          verbiage: Compliance
+          message: |
+            ${{ needs.compliance-scan.result == 'failure' && ':x: *Compliance scan FAILED* — failed checks on production host.' || ':white_check_mark: *Compliance scan completed* — host checks finished.' }}
+            Weekly compliance check of EC2 instance and container configuration.
+          fields: >-
+            [
+              {"title": "Target Host", "value": "${{ secrets.EC2_HOST }}", "short": true},
+              {"title": "Pass / Fail / Info", "value": "${{ steps.vars.outputs.pass_count }} / ${{ steps.vars.outputs.fail_count }} / ${{ steps.vars.outputs.info_count }}", "short": true},
+              {"title": "Trigger", "value": "${{ github.event_name }}", "short": true},
+              {"title": "Result", "value": "${{ needs.compliance-scan.result }}", "short": true}
+            ]

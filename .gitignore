@@ -1,0 +1,141 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.coverage
+.coverage.*
+htmlcov/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Environment Variables & Secrets
+.env
+.env.local
+.env.*.local
+.env.backup
+.env.production
+.env.prod
+.env.vercel
+*.key
+*.pem
+
+# Cookie/session files
+cookies*.txt
+
+# User Data & Databases
+users.json
+user_data/
+previous_chats/
+quiz_results/
+chat_history/
+chroma_db/
+persisted_index/
+
+# Application Specific
+Ollama.app/
+
+# Generated/Temporary Files
+*.log
+*.tmp
+*.cache
+*.pid
+output.txt
+chunk_analysis.txt
+chunks_output.txt
+query_log.txt
+previous_chats-2
+logs/*.pid
+
+# Test Results
+test_results*.json
+demo_test_results.py
+
+# Playwright CLI snapshots (may capture sensitive form data / PII)
+.playwright-cli/
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# Data Processing Output
+chunks_by_type/*.txt
+
+# JWT RSA Keys (keep private!)
+keys/jwt_private.pem
+
+# Next.js
+frontend/.next/
+frontend/out/
+frontend/.vercel
+frontend/node_modules/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/.terraform.lock.hcl
+terraform/crash.log
+terraform/crash.*.log
+
+# Vector Indices (large files - regenerate from S3)
+s3_vector_index.pkl
+*.pkl
+
+# Archive directories
+_archive/
+archive_test_scripts/
+
+# Log directories
+logs/
+*.log
+.streamlit/secrets.toml
+
+# RAG Pipeline Artifacts 
+RAG Architecture.draw.io 
+RAG Architecture.html 
+RAG Architecture.png 
+
+.vercel

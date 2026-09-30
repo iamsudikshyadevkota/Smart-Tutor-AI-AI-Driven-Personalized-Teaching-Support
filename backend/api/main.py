@@ -1,0 +1,557 @@
+import asyncio
+import logging
+import os
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, Response, Header, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+import ipaddress
+import time
+
+from backend.api.routes import register_routes
+from backend.config import config
+from backend.metrics import PrometheusMiddleware, metrics_handler, set_app_info
+from backend.rate_limiter import limiter  # Import from rate_limiter to avoid circular imports
+
+logger = logging.getLogger(__name__)
+PUBLIC_CACHEABLE_PATHS = {"/", "/robots.txt", "/sitemap.xml"}
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Delegates to the existing startup/shutdown handlers defined further down.
+    # Python resolves the names at call time, so forward references are fine.
+    await startup_event()
+    try:
+        yield
+    finally:
+        await shutdown_event()
+
+
+app = FastAPI(
+    title="Smart AI Tutor API",
+    version="1.0.0",
+    docs_url="/docs" if config.ENVIRONMENT != "production" else None,  # Disable docs in production
+    redoc_url="/redoc" if config.ENVIRONMENT != "production" else None,
+    lifespan=lifespan,
+)
+
+# Add rate limiting state and error handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS Configuration - CRITICAL SECURITY FIX
+# In production, this should be restricted to your actual frontend domain(s)
+# Get production domains from environment variable (comma-separated)
+production_domains = os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+production_domains = [d.strip() for d in production_domains if d.strip()]
+
+if config.ENVIRONMENT == "production":
+    # Production: Require explicit CORS configuration
+    if not production_domains:
+        # FAIL FAST: Do not start without CORS configuration
+        raise RuntimeError(
+            "CRITICAL: CORS_ALLOWED_ORIGINS must be set in production. "
+            "Example: CORS_ALLOWED_ORIGINS=https://yourdomain.com,https://app.yourdomain.com"
+        )
+
+    allowed_origins = production_domains
+
+    # Optionally allow localhost for testing (set CORS_ALLOW_LOCALHOST=true)
+    # WARNING: This should be disabled in production
+    if os.getenv("CORS_ALLOW_LOCALHOST", "false").lower() == "true":
+        import logging
+        logging.warning(
+            "⚠️  SECURITY WARNING: CORS_ALLOW_LOCALHOST is enabled in production. "
+            "This should be disabled for security."
+        )
+        allowed_origins.extend([
+            "http://localhost:3000",
+            "http://localhost:4000",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:4000",
+        ])
+else:
+    # Development: Allow localhost
+    allowed_origins = [
+        "http://localhost:3000",  # Next.js frontend
+        "http://localhost:4000",  # Next.js frontend port
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:4000",
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-CSRF-Token"],
+    max_age=600,  # Cache preflight requests for 10 minutes
+)
+
+# HTTPS Enforcement Middleware
+@app.middleware("http")
+async def enforce_https(request: Request, call_next):
+    """Enforce HTTPS in production and optionally in development"""
+    if config.ENFORCE_HTTPS:
+        # Check if request is over HTTP (not HTTPS)
+        if request.url.scheme != "https":
+            # Allow health check and docs on HTTP for internal use
+            if request.url.path not in ["/health", "/ready", "/docs", "/redoc", "/openapi.json"]:
+                # Get the HTTPS URL
+                https_url = request.url.replace(scheme="https")
+                return JSONResponse(
+                    status_code=307,  # Temporary Redirect
+                    content={"detail": "HTTPS required"},
+                    headers={"Location": str(https_url)}
+                )
+
+    response = await call_next(request)
+    return response
+
+# Security Headers Middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """Add security headers to all responses"""
+    response = await call_next(request)
+
+    # Security headers
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
+
+    if request.method == "GET" and request.url.path in PUBLIC_CACHEABLE_PATHS:
+        response.headers["Cache-Control"] = "public, max-age=300"
+        if "Pragma" in response.headers:
+            del response.headers["Pragma"]
+    else:
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+
+    # Content Security Policy - relaxed for API-only backend
+    if config.ENVIRONMENT == "production":
+        # API backend doesn't serve HTML, so CSP is minimal
+        response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+
+    return response
+
+# Request timing middleware (for monitoring)
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    """Add request processing time header"""
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = str(process_time)
+    return response
+
+# Add SlowAPI middleware for rate limiting
+app.add_middleware(SlowAPIMiddleware)
+
+# Add Prometheus metrics middleware
+app.add_middleware(PrometheusMiddleware)
+
+# Add security middleware
+from backend.security_middleware import add_security_middleware
+add_security_middleware(app, config={
+    "max_request_size": config.MAX_UPLOAD_SIZE,
+    "slow_request_threshold": 5.0,
+    "max_auth_failures": 10,
+    "block_duration": 900,  # 15 minutes
+})
+
+# Trusted Host middleware (prevent host header injection)
+if config.ENVIRONMENT == "production":
+    _trusted_hosts = os.environ.get("TRUSTED_HOSTS", "").split(",")
+    _trusted_hosts = [h.strip() for h in _trusted_hosts if h.strip()]
+    if _trusted_hosts:
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=_trusted_hosts,
+        )
+
+
+@app.get("/")
+async def root():
+    return {"message": "Smart AI Tutor API", "version": "1.0.0"}
+
+
+@app.get("/robots.txt")
+async def robots_txt():
+    # API backend should not be indexed — `/docs`, `/metrics`, etc. are not for crawlers.
+    return Response(
+        content="User-agent: *\nDisallow: /\n",
+        media_type="text/plain",
+    )
+
+
+@app.get("/sitemap.xml")
+async def sitemap():
+    # Site root is configurable so production doesn't ship the `.local` placeholder.
+    site_url = os.getenv("PUBLIC_SITE_URL", "https://smartaitutor.com").rstrip("/")
+    return Response(
+        content=(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            f"<url><loc>{site_url}/</loc></url>"
+            "</urlset>"
+        ),
+        media_type="application/xml",
+    )
+
+
+@app.get("/health")
+@limiter.limit("10/minute")  # Rate limit health checks
+async def health_check(request: Request):
+    """Simple health check endpoint. Returns 503 when a core dependency
+    (database, redis, bedrock, neo4j, s3) is unhealthy so callers relying
+    on HTTP status (curl -f, uptime monitors) actually detect failure --
+    a "degraded" status (only a peripheral like langfuse/posthog is down)
+    still returns 200, since the app is substantively still serving."""
+    from backend.health import HealthChecker
+    health = HealthChecker.get_simple_health()
+
+    status_code = 503 if health["status"] == "unhealthy" else 200
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            **health,
+            "environment": config.ENVIRONMENT,
+            "version": "1.0.0"
+        },
+    )
+
+
+@app.get("/ready")
+@limiter.limit("30/minute")
+async def readiness_check(request: Request):
+    """Readiness probe for deploys, rollbacks, and load balancers.
+
+    Checks only database and redis -- the dependencies nearly every
+    request needs -- and returns 503 when either is down. Deliberately
+    fast and cheap: this is Docker's HEALTHCHECK target, polled every 5s
+    for the entire lifetime of the container, so it must not carry the
+    latency or cost of the external checks (Bedrock, Neo4j, S3, Secrets
+    Manager) that live in /health instead.
+    """
+    from backend.health import HealthChecker
+    result = HealthChecker.get_liveness_core()
+
+    status_code = 200 if result["status"] == "ready" else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            **result,
+            "environment": config.ENVIRONMENT,
+            "version": "1.0.0"
+        },
+    )
+
+
+@app.get("/health/detailed")
+@limiter.limit("5/minute")  # More restrictive for detailed check
+async def detailed_health_check(request: Request):
+    """Detailed health check with all component status"""
+    from backend.health import HealthChecker
+    return HealthChecker.get_detailed_health()
+
+
+@app.get("/csrf-token")
+async def get_csrf_token_endpoint(request: Request, response: Response):
+    """
+    Get CSRF token for the current session.
+
+    This endpoint should be called on application load to obtain a CSRF token.
+    The token will be set in a cookie and returned in the response.
+
+    Returns:
+        dict: Contains the CSRF token
+    """
+    from backend.csrf_protection import get_csrf_token
+
+    token = get_csrf_token(request, response)
+    return {
+        "csrf_token": token,
+        "header_name": "X-CSRF-Token",
+        "message": "Include this token in X-CSRF-Token header for state-changing requests"
+    }
+
+
+@app.get("/metrics")
+async def metrics(
+    authorization: str | None = Header(None, alias="Authorization"),
+    request: Request = None
+):
+    """
+    Prometheus metrics endpoint with authentication.
+
+    SECURITY: Requires valid authentication token.
+    In production, consider restricting to admin role or IP whitelist.
+    """
+    from backend.auth_service import get_auth_service
+
+    # SECURITY: Require authentication for metrics endpoint
+    if not authorization:
+        # Allow unauthenticated access only from explicitly trusted scrapers
+        client_host = request.client.host if request and request.client else None
+        # Only allow exact loopback addresses; Prometheus should use auth token
+        # or be configured in METRICS_ALLOWED_IPS env var
+        allowed_raw = os.environ.get("METRICS_ALLOWED_IPS", "127.0.0.1,::1,172.16.0.0/12").split(",")
+        allowed_raw = [ip.strip() for ip in allowed_raw if ip.strip()]
+
+        def _ip_allowed(host: str) -> bool:
+            try:
+                addr = ipaddress.ip_address(host)
+            except ValueError:
+                return False
+            for entry in allowed_raw:
+                try:
+                    if "/" in entry:
+                        if addr in ipaddress.ip_network(entry, strict=False):
+                            return True
+                    else:
+                        if addr == ipaddress.ip_address(entry):
+                            return True
+                except ValueError:
+                    continue
+            return False
+
+        if not client_host or not _ip_allowed(client_host):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required for metrics endpoint"
+            )
+    else:
+        # Validate token if provided
+        try:
+            token = authorization.split(" ")[1] if " " in authorization else authorization
+            auth_service = get_auth_service()
+            user = auth_service.validate_session(token)
+
+            if user.get("role") != "Admin":
+                raise HTTPException(status_code=403, detail="Admin access required")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication token"
+            )
+
+    return metrics_handler()
+
+
+def _get_startup_background_tasks() -> list[asyncio.Task]:
+    tasks = getattr(app.state, "startup_background_tasks", None)
+    if tasks is None:
+        tasks = []
+        app.state.startup_background_tasks = tasks
+    return tasks
+
+
+def _schedule_startup_background_task(name: str, coro) -> None:
+    task = asyncio.create_task(coro, name=f"startup:{name}")
+    tasks = _get_startup_background_tasks()
+    tasks.append(task)
+
+    def _on_done(completed_task: asyncio.Task) -> None:
+        try:
+            completed_task.result()
+        except asyncio.CancelledError:
+            logger.info("ℹ️  %s cancelled", name)
+        except Exception as exc:
+            logger.warning("%s failed: %s", name, exc)
+        finally:
+            if completed_task in tasks:
+                tasks.remove(completed_task)
+
+    task.add_done_callback(_on_done)
+    logger.info("ℹ️  %s scheduled in background", name)
+
+
+async def _initialize_langfuse_background() -> None:
+    from backend.langfuse_setup import init_langfuse
+
+    if await asyncio.to_thread(init_langfuse):
+        logger.info("✅ Langfuse tracing initialized")
+    else:
+        logger.info("ℹ️  Langfuse tracing not active")
+
+
+async def _write_reproducibility_manifest_background() -> None:
+    from backend.reproducibility import write_manifest
+
+    await asyncio.to_thread(write_manifest, config.REPRODUCIBILITY_MANIFEST_PATH)
+    logger.info("✅ Reproducibility manifest written")
+
+
+async def _run_warmup_background() -> None:
+    from backend.warmup import run_warmup
+
+    await run_warmup()
+
+
+def _seed_admin_user() -> None:
+    from backend.database import get_user_db
+    import bcrypt
+
+    user_db = get_user_db()
+    users = user_db.list_users()
+    has_admin = any(u.get("role") == "Admin" for u in users)
+
+    if has_admin:
+        logger.info("✅ Admin user already exists")
+        return
+
+    admin_password = os.environ.get("ADMIN_SEED_PASSWORD")
+    if not admin_password:
+        logger.warning("⚠️  No ADMIN_SEED_PASSWORD env var set — skipping admin seed")
+        return
+
+    hashed = bcrypt.hashpw(
+        admin_password.encode("utf-8"), bcrypt.gensalt()
+    ).decode("utf-8")
+    user_db.create_user(
+        username="admin",
+        password_hash=hashed,
+        email="admin@infra-mind.com",
+        full_name="Admin",
+        role="Admin",
+    )
+    logger.info("Admin user seeded (password from ADMIN_SEED_PASSWORD env var)")
+
+
+async def _seed_admin_user_background() -> None:
+    await asyncio.to_thread(_seed_admin_user)
+
+
+# Lifespan-invoked startup handler (see `lifespan()` near the top of this module).
+async def startup_event():
+    """Validate configuration and initialize resources on startup"""
+    logger.info("=" * 60)
+    logger.info("Smart AI Tutor API Starting Up")
+    logger.info(f"Environment: {config.ENVIRONMENT}")
+    logger.info(f"Storage Backend: {config.STORAGE_BACKEND}")
+    logger.info(f"LLM Provider: {config.LLM_PROVIDER}")
+    logger.info("=" * 60)
+
+    # Validate configuration
+    validation_result = config.validate()
+
+    if validation_result["warnings"]:
+        logger.warning("Configuration Warnings:")
+        for warning in validation_result["warnings"]:
+            logger.warning(f"  ⚠️  {warning}")
+
+    if validation_result["errors"]:
+        logger.error("Configuration Errors:")
+        for error in validation_result["errors"]:
+            logger.error(f"  ❌ {error}")
+
+        # FAIL FAST: Do not start in production with configuration errors
+        if config.ENVIRONMENT == "production":
+            raise RuntimeError(
+                "CRITICAL: Application cannot start in production with configuration errors. "
+                "Fix the errors listed above and try again."
+            )
+        else:
+            logger.error("⚠️  Application starting in development mode despite configuration errors")
+
+    if validation_result["valid"]:
+        logger.info("✅ Configuration validation passed")
+
+    # Initialize Prometheus metrics metadata
+    set_app_info(version="1.0.0", environment=config.ENVIRONMENT)
+    logger.info("✅ Prometheus metrics initialized")
+
+    # Initialize OpenTelemetry tracing for production observability
+    otel_enabled = os.getenv("OTEL_ENABLED", "false").lower() == "true"
+    if otel_enabled:
+        try:
+            from backend.tracing_otel import init_tracing, instrument_fastapi
+
+            init_tracing(
+                service_name=os.getenv("OTEL_SERVICE_NAME", "smart-ai-tutor-backend"),
+                service_version="1.0.0",
+                environment=config.ENVIRONMENT,
+                enabled=True,
+                sampling_rate=float(os.getenv("OTEL_SAMPLING_RATE", "1.0")),
+                otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", None),
+            )
+            instrument_fastapi(app)
+            logger.info("✅ OpenTelemetry tracing initialized")
+        except Exception as exc:
+            logger.warning("OpenTelemetry tracing setup failed: %s", exc)
+    else:
+        logger.info("ℹ️  OpenTelemetry tracing not active")
+
+    # Optional startup work should not block readiness in production.
+    _schedule_startup_background_task("Langfuse tracing initialization", _initialize_langfuse_background())
+
+    if config.REPRODUCIBILITY_ENABLED:
+        _schedule_startup_background_task(
+            "Reproducibility manifest write",
+            _write_reproducibility_manifest_background(),
+        )
+
+    _schedule_startup_background_task("Cold-start warmup", _run_warmup_background())
+
+    _schedule_startup_background_task("Admin user seed", _seed_admin_user_background())
+
+    logger.info("=" * 60)
+
+
+# Lifespan-invoked shutdown handler (see `lifespan()` near the top of this module).
+async def shutdown_event():
+    """Cleanup resources on shutdown"""
+    logger.info("=" * 60)
+    logger.info("Smart AI Tutor API Shutting Down")
+    logger.info("=" * 60)
+
+    background_tasks = list(getattr(app.state, "startup_background_tasks", []))
+    for task in background_tasks:
+        if not task.done():
+            task.cancel()
+    if background_tasks:
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+
+    # Close database connections
+    try:
+        from backend.database import _user_db
+        if _user_db and hasattr(_user_db, 'close'):
+            _user_db.close()
+            logger.info("✅ Database connections closed")
+    except Exception as e:
+        logger.error(f"❌ Error closing database connections: {e}")
+
+    # Close Redis connections
+    try:
+        from backend.redis_cache import _redis_cache
+        if _redis_cache and hasattr(_redis_cache, 'close'):
+            _redis_cache.close()
+            logger.info("✅ Redis connections closed")
+    except Exception as e:
+        logger.error(f"❌ Error closing Redis connections: {e}")
+
+    # Flush Langfuse events
+    try:
+        from backend.langfuse_setup import shutdown_langfuse
+        shutdown_langfuse()
+        logger.info("✅ Langfuse events flushed")
+    except Exception as e:
+        logger.error(f"❌ Error flushing Langfuse: {e}")
+
+    logger.info("=" * 60)
+    logger.info("Shutdown complete")
+    logger.info("=" * 60)
+
+
+register_routes(app)

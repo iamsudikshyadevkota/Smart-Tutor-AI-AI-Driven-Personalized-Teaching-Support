@@ -1,0 +1,632 @@
+name: Scheduled RAG Evaluation
+
+on:
+  schedule:
+    # 16:00 UTC = 11am CDT / 10am CST, Mon-Fri only — inside the 9AM-5PM
+    # Central maintenance window so this doesn't wake the cost-saving EC2
+    # instance outside its scheduled hours (it was previously "0 6 * * *",
+    # 1am Central every day including weekends).
+    - cron: "0 16 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dataset_limit:
+        type: string
+        description: "Number of dataset questions to evaluate (overrides EVALUATION_DATASET_LIMIT)"
+        required: false
+        default: ""
+      min_avg_correctness:
+        type: string
+        description: "Minimum average correctness score before the workflow fails"
+        required: false
+        default: ""
+      min_avg_context_recall:
+        type: string
+        description: "Minimum average context recall score before the workflow fails"
+        required: false
+        default: ""
+      max_avg_drift_score:
+        type: string
+        description: "Maximum average model drift score before the workflow fails"
+        required: false
+        default: ""
+      enforce_quality_gates:
+        type: string
+        description: "Set to true to fail the workflow on score thresholds; defaults to false for monitoring runs"
+        required: false
+        default: ""
+      model_id:
+        type: string
+        description: "Model ID to evaluate (overrides EVALUATION_MODEL_ID; leave blank for default)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rag-evaluation-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  run-dataset-evaluation:
+    name: Run Dataset Evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY || '' }}
+      EC2_HOST: ${{ secrets.EC2_HOST || '' }}
+      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID || vars.EC2_INSTANCE_ID || '' }}
+      EC2_INSTANCE_NAME: ${{ vars.EC2_INSTANCE_NAME || '' }}
+      EC2_AUTO_START: ${{ vars.EC2_AUTO_START || 'true' }}
+      EC2_TEMPORARY_SSH_INGRESS: ${{ vars.EC2_TEMPORARY_SSH_INGRESS || 'true' }}
+      EC2_USER: ${{ secrets.EC2_USER || '' }}
+      EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY || '' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Step 1 — Validate required configuration before doing any network work
+      # -----------------------------------------------------------------------
+      - name: Validate required secrets and variables
+        env:
+          EVALUATION_BACKEND_URL: ${{ secrets.EVALUATION_BACKEND_URL || vars.EVALUATION_BACKEND_URL_PROD }}
+          EVALUATION_CRON_TOKEN: ${{ secrets.EVALUATION_CRON_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          missing=()
+
+          if [ -z "${EVALUATION_BACKEND_URL}" ]; then
+            missing+=("EVALUATION_BACKEND_URL (secret) — base URL of your FastAPI backend, e.g. https://api.yourapp.com")
+          fi
+
+          if [ -z "${EVALUATION_CRON_TOKEN}" ]; then
+            missing+=("EVALUATION_CRON_TOKEN (secret) — shared token validated by POST /evaluation/run-scheduled")
+          fi
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::One or more required secrets are not configured in this repository."
+            echo ""
+            echo "Missing configuration:"
+            for item in "${missing[@]}"; do
+              echo "  ✗ $item"
+            done
+            echo ""
+            echo "Fix: Go to  Settings → Secrets and variables → Actions → New repository secret"
+            echo "     and add each missing value listed above."
+            exit 1
+          fi
+
+          echo "✓ All required secrets are present."
+
+      - name: Install AWS CLI
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' && env.AWS_SECRET_ACCESS_KEY != '' && (env.EC2_HOST != '' || env.EC2_INSTANCE_ID != '' || env.EC2_INSTANCE_NAME != '') }}
+        uses: unfor19/install-aws-cli-action@e8b481e524a99f37fbd39fdc1dcb3341ab091367  # v1.0.7
+
+      - name: Resolve production EC2 target
+        if: ${{ env.EC2_HOST != '' || env.EC2_INSTANCE_ID != '' || env.EC2_INSTANCE_NAME != '' }}
+        run: scripts/ci/resolve_ec2_target.sh
+
+      # -----------------------------------------------------------------------
+      # Step 2 — Build payload and call the backend
+      # -----------------------------------------------------------------------
+      - name: Trigger scheduled evaluation
+        env:
+          EVALUATION_BACKEND_URL: ${{ secrets.EVALUATION_BACKEND_URL || vars.EVALUATION_BACKEND_URL_PROD }}
+          EVALUATION_CRON_TOKEN: ${{ secrets.EVALUATION_CRON_TOKEN }}
+          REQUESTED_EVALUATION_DATASET_LIMIT: ${{ inputs.dataset_limit || '' }}
+          DEFAULT_EVALUATION_DATASET_LIMIT: ${{ vars.EVALUATION_DATASET_LIMIT || '20' }}
+          SCHEDULED_EVALUATION_DATASET_LIMIT: ${{ vars.EVALUATION_SCHEDULED_DATASET_LIMIT || '5' }}
+          MIN_AVG_CORRECTNESS: ${{ inputs.min_avg_correctness || vars.MIN_AVG_CORRECTNESS || '0.55' }}
+          MIN_AVG_CONTEXT_RECALL: ${{ inputs.min_avg_context_recall || vars.MIN_AVG_CONTEXT_RECALL || '0.55' }}
+          MAX_AVG_DRIFT_SCORE: ${{ inputs.max_avg_drift_score || vars.MAX_AVG_DRIFT_SCORE || '2.50' }}
+          EVALUATION_MODEL_ID: ${{ inputs.model_id || vars.EVALUATION_MODEL_ID || '' }}
+          ENFORCE_QUALITY_GATES: ${{ inputs.enforce_quality_gates || vars.ENFORCE_QUALITY_GATES || 'false' }}
+          SCHEDULED_RAG_REQUIRE_BACKEND: ${{ vars.SCHEDULED_RAG_REQUIRE_BACKEND || 'false' }}
+          INTERNAL_EVALUATION_TIMEOUT_SECONDS: ${{ vars.EVALUATION_INTERNAL_TIMEOUT_SECONDS || '900' }}
+          PUBLIC_EVALUATION_TIMEOUT_SECONDS: ${{ vars.EVALUATION_PUBLIC_TIMEOUT_SECONDS || '120' }}
+          WORKFLOW_TRIGGER: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          # Strip any accidental trailing slash from the URL so the path never
+          # becomes double-slashed (e.g. https://api.example.com//evaluation/...)
+          base_url="${EVALUATION_BACKEND_URL%/}"
+
+          if [[ ! "${base_url}" =~ ^https?:// ]]; then
+            echo "::error::EVALUATION_BACKEND_URL must start with http:// or https://"
+            exit 1
+          fi
+
+          if [ "${WORKFLOW_TRIGGER}" = "workflow_dispatch" ]; then
+            if [ -n "${REQUESTED_EVALUATION_DATASET_LIMIT}" ]; then
+              dataset_limit="${REQUESTED_EVALUATION_DATASET_LIMIT}"
+            else
+              dataset_limit="${DEFAULT_EVALUATION_DATASET_LIMIT}"
+            fi
+          else
+            dataset_limit="${SCHEDULED_EVALUATION_DATASET_LIMIT}"
+          fi
+
+          if [[ ! "${dataset_limit}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Evaluation dataset limit must be a positive integer. Received: ${dataset_limit}"
+            exit 1
+          fi
+
+          enforce_quality_gates="$(printf '%s' "${ENFORCE_QUALITY_GATES}" | tr '[:upper:]' '[:lower:]')"
+          if [ "${WORKFLOW_TRIGGER}" != "workflow_dispatch" ]; then
+            enforce_quality_gates="false"
+          fi
+          if [ "${enforce_quality_gates}" != "true" ] && [ "${enforce_quality_gates}" != "false" ]; then
+            echo "::error::ENFORCE_QUALITY_GATES must be either true or false. Received: ${ENFORCE_QUALITY_GATES}"
+            exit 1
+          fi
+
+          if [ "${dataset_limit}" -lt 1 ] || [ "${dataset_limit}" -gt 64 ]; then
+            echo "::error::Evaluation dataset limit must be between 1 and 64 to match backend validation. Received: ${dataset_limit}"
+            exit 1
+          fi
+
+          # Build JSON payload — only include model_id when explicitly set
+          if [ -n "${EVALUATION_MODEL_ID}" ]; then
+            payload="{\"limit\": ${dataset_limit}, \"model_id\": \"${EVALUATION_MODEL_ID}\"}"
+          else
+            payload="{\"limit\": ${dataset_limit}}"
+          fi
+
+          echo "Endpoint : ${base_url}/evaluation/run-scheduled"
+          echo "Payload  : ${payload}"
+          echo ""
+
+          invoke_public_endpoint() {
+            curl -sS \
+              --fail \
+              --max-time "${PUBLIC_EVALUATION_TIMEOUT_SECONDS}" \
+              --retry 1 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              -X POST "${base_url}/evaluation/run-scheduled" \
+              -H "Content-Type: application/json" \
+              -H "X-Evaluation-Token: ${EVALUATION_CRON_TOKEN}" \
+              -d "${payload}" \
+              --output /tmp/eval_response.json \
+              --write-out "%{http_code}" \
+              || true
+          }
+
+          invoke_ec2_internal_endpoint() {
+            if [ -z "${EC2_HOST}" ] || [ -z "${EC2_USER}" ] || [ -z "${EC2_SSH_KEY}" ]; then
+              return 1
+            fi
+
+            local key_file
+            local model_arg
+            key_file="$(mktemp)"
+            printf '%s\n' "${EC2_SSH_KEY}" > "${key_file}"
+            chmod 600 "${key_file}"
+            local ssh_opts
+            ssh_opts=(-o StrictHostKeyChecking=no -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=20 -o ConnectionAttempts=2 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o TCPKeepAlive=yes)
+
+            model_arg=""
+            if [ -n "${EVALUATION_MODEL_ID}" ]; then
+              model_arg="--model-id ${EVALUATION_MODEL_ID}"
+            fi
+
+            if ! ssh "${ssh_opts[@]}" -i "${key_file}" "${EC2_USER}@${EC2_HOST}" "printf 'ssh-ok\n'" >/dev/null 2>/tmp/eval_fallback_error.log; then
+              rm -f "${key_file}"
+              return 1
+            fi
+
+            if ssh "${ssh_opts[@]}" -i "${key_file}" "${EC2_USER}@${EC2_HOST}" \
+              "DATASET_LIMIT='${dataset_limit}' EVALUATION_TIMEOUT='${INTERNAL_EVALUATION_TIMEOUT_SECONDS}' MODEL_ARG='${model_arg}' bash -lc '
+                set -euo pipefail
+                for _ in 1 2 3 4 5 6; do
+                  status=\$(docker inspect -f \"{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}\" smart-tutor-backend 2>/dev/null || true)
+                  if [ \"\$status\" = \"healthy\" ] || [ \"\$status\" = \"none\" ]; then
+                    break
+                  fi
+                  sleep 10
+                done
+                timeout \"\$EVALUATION_TIMEOUT\" docker exec smart-tutor-backend sh -lc \"python -m backend.scripts.run_scheduled_evaluation --limit \$DATASET_LIMIT --source scheduled \$MODEL_ARG\"
+              '" \
+              > /tmp/eval_response.json 2>/tmp/eval_fallback_error.log
+            then
+              rm -f "${key_file}"
+              return 0
+            fi
+
+            rm -f "${key_file}"
+            return 1
+          }
+
+          # Prefer the internal backend path when EC2 credentials are available.
+          # That keeps the scheduled evaluation independent of public nginx /
+          # load balancer failures. Fall back to the public endpoint only when
+          # internal execution is unavailable.
+          response_source="public-api"
+          http_code=""
+
+          if invoke_ec2_internal_endpoint; then
+            http_code="200"
+            response_source="ec2-container-script"
+          else
+            if [ -s /tmp/eval_fallback_error.log ]; then
+              cp /tmp/eval_fallback_error.log /tmp/eval_response.json
+            fi
+
+            http_code="$(invoke_public_endpoint)"
+          fi
+
+          response=$(cat /tmp/eval_response.json 2>/dev/null || echo "(no response body)")
+
+          response_is_json=false
+          if [ -f /tmp/eval_response.json ] && jq empty /tmp/eval_response.json 2>/dev/null; then
+            response_is_json=true
+          fi
+
+          total_evaluated=""
+          total_dataset_questions=""
+          avg_latency=""
+          quality_summary_type=""
+          result_message=""
+          avg_faithfulness=""
+          avg_answer_relevance=""
+          avg_context_recall=""
+          avg_context_precision=""
+          avg_correctness=""
+          dataset_path=""
+          drift_summary_type=""
+          avg_drift_score=""
+          max_drift_score=""
+          high_drift_count=""
+          recommendations_json="[]"
+          delta_correctness=""
+          delta_context_recall=""
+          delta_avg_drift=""
+          if [ "${response_is_json}" = "true" ]; then
+            # Handle NDJSON (multiple JSON objects concatenated): extract only the
+            # last object — it contains the actual evaluation result. All preceding
+            # lines are server-side log emissions written to the same file.
+            last_response=$(jq -s '.[-1]' /tmp/eval_response.json 2>/dev/null || echo "{}")
+            echo "${last_response}" > /tmp/eval_final_result.json
+
+            total_evaluated="$(jq -r '.total_evaluated // empty' /tmp/eval_final_result.json)"
+            total_dataset_questions="$(jq -r '.total_dataset_questions // empty' /tmp/eval_final_result.json)"
+            avg_latency="$(jq -r '.avg_latency // empty' /tmp/eval_final_result.json)"
+            dataset_path="$(jq -r '.dataset_path // .run_record.dataset // empty' /tmp/eval_final_result.json)"
+            quality_summary_type="$(jq -r 'if .quality_summary == null then "null" else (.quality_summary | type) end' /tmp/eval_final_result.json)"
+            drift_summary_type="$(jq -r 'if .drift_summary == null then "null" else (.drift_summary | type) end' /tmp/eval_final_result.json)"
+            result_message="$(jq -r '.message // empty' /tmp/eval_final_result.json)"
+            avg_faithfulness="$(jq -r '.quality_summary.avg_faithfulness // empty' /tmp/eval_final_result.json)"
+            avg_answer_relevance="$(jq -r '.quality_summary.avg_answer_relevance // empty' /tmp/eval_final_result.json)"
+            avg_context_recall="$(jq -r '.quality_summary.avg_context_recall // empty' /tmp/eval_final_result.json)"
+            avg_context_precision="$(jq -r '.quality_summary.avg_context_precision // empty' /tmp/eval_final_result.json)"
+            avg_correctness="$(jq -r '.quality_summary.avg_correctness // empty' /tmp/eval_final_result.json)"
+            avg_drift_score="$(jq -r '.drift_summary.avg_drift_score // empty' /tmp/eval_final_result.json)"
+            max_drift_score="$(jq -r '.drift_summary.max_drift_score // empty' /tmp/eval_final_result.json)"
+            high_drift_count="$(jq -r '.drift_summary.high_drift_count // empty' /tmp/eval_final_result.json)"
+            recommendations_json="$(jq -c '.recommendations // []' /tmp/eval_final_result.json)"
+            delta_correctness="$(jq -r '.run_record.summary.delta.avg_correctness // empty' /tmp/eval_final_result.json)"
+            delta_context_recall="$(jq -r '.run_record.summary.delta.avg_context_recall // empty' /tmp/eval_final_result.json)"
+            delta_avg_drift="$(jq -r '.run_record.summary.delta.avg_drift_score // empty' /tmp/eval_final_result.json)"
+
+            # Write clean summary using the isolated final result object
+            jq \
+              --arg http_code "${http_code}" \
+              --arg response_source "${response_source}" \
+              --arg dataset_limit "${dataset_limit}" \
+              --arg min_avg_correctness "${MIN_AVG_CORRECTNESS}" \
+              --arg min_avg_context_recall "${MIN_AVG_CONTEXT_RECALL}" \
+              --arg max_avg_drift_score "${MAX_AVG_DRIFT_SCORE}" \
+              '{
+                http_code: $http_code,
+                response_source: $response_source,
+                dataset_limit: ($dataset_limit | tonumber),
+                thresholds: {
+                  min_avg_correctness: ($min_avg_correctness | tonumber),
+                  min_avg_context_recall: ($min_avg_context_recall | tonumber),
+                  max_avg_drift_score: ($max_avg_drift_score | tonumber)
+                },
+                response: .
+              }' /tmp/eval_final_result.json > /tmp/eval_summary.json
+          else
+            jq -n \
+              --arg http_code "${http_code}" \
+              --arg response_source "${response_source}" \
+              --arg dataset_limit "${dataset_limit}" \
+              --arg min_avg_correctness "${MIN_AVG_CORRECTNESS}" \
+              --arg min_avg_context_recall "${MIN_AVG_CONTEXT_RECALL}" \
+              --arg max_avg_drift_score "${MAX_AVG_DRIFT_SCORE}" \
+              '{
+                http_code: $http_code,
+                response_source: $response_source,
+                dataset_limit: ($dataset_limit | tonumber),
+                response_is_json: false,
+                thresholds: {
+                  min_avg_correctness: ($min_avg_correctness | tonumber),
+                  min_avg_context_recall: ($min_avg_context_recall | tonumber),
+                  max_avg_drift_score: ($max_avg_drift_score | tonumber)
+                },
+                response: null
+              }' > /tmp/eval_summary.json
+          fi
+
+          # ── Write Job Summary ──────────────────────────────────────────────
+          {
+            echo "## Scheduled RAG Evaluation"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| HTTP Status | \`${http_code}\` |"
+            echo "| Response Source | \`${response_source}\` |"
+            echo "| Dataset Limit | \`${dataset_limit}\` |"
+            echo "| Model ID | \`${EVALUATION_MODEL_ID:-default}\` |"
+            echo "| Enforce Quality Gates | \`${enforce_quality_gates}\` |"
+            echo "| Triggered by | \`${{ github.event_name }}\` |"
+            echo "| Run | [\`${{ github.run_id }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+            if [ "${response_is_json}" = "true" ]; then
+              echo "| Total Evaluated | \`${total_evaluated:-unknown}\` |"
+              echo "| Dataset Questions | \`${total_dataset_questions:-unknown}\` |"
+              echo "| Dataset Path | \`${dataset_path:-unknown}\` |"
+              echo "| Avg Latency | \`${avg_latency:-unknown}\` |"
+              echo "| Quality Summary | \`${quality_summary_type}\` |"
+              echo "| Drift Summary | \`${drift_summary_type}\` |"
+              if [ "${quality_summary_type}" = "object" ]; then
+                echo "| Avg Faithfulness | \`${avg_faithfulness:-unknown}\` |"
+                echo "| Avg Answer Relevance | \`${avg_answer_relevance:-unknown}\` |"
+                echo "| Avg Context Recall | \`${avg_context_recall:-unknown}\` |"
+                echo "| Avg Context Precision | \`${avg_context_precision:-unknown}\` |"
+                echo "| Avg Correctness | \`${avg_correctness:-unknown}\` |"
+                echo "| Delta Correctness | \`${delta_correctness:-n/a}\` |"
+                echo "| Delta Context Recall | \`${delta_context_recall:-n/a}\` |"
+              fi
+              if [ "${drift_summary_type}" = "object" ]; then
+                echo "| Avg Drift Score | \`${avg_drift_score:-unknown}\` |"
+                echo "| Max Drift Score | \`${max_drift_score:-unknown}\` |"
+                echo "| High Drift Count | \`${high_drift_count:-unknown}\` |"
+                echo "| Delta Avg Drift | \`${delta_avg_drift:-n/a}\` |"
+              fi
+            fi
+            echo ""
+            echo "### Recommendations"
+            jq -r '.[]? | "- " + .' <<< "${recommendations_json}"
+            echo ""
+            echo "### Response Body"
+            echo '```json'
+            echo "${response}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # ── Fail the step if the backend returned an error ─────────────────
+          if [ -z "${http_code}" ] || [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
+            if [ "${WORKFLOW_TRIGGER}" = "schedule" ] && \
+               [ "$(printf '%s' "${SCHEDULED_RAG_REQUIRE_BACKEND}" | tr '[:upper:]' '[:lower:]')" != "true" ] && \
+               { [ -z "${http_code}" ] || [ "${http_code}" = "000" ]; }; then
+              echo "::warning::Scheduled RAG evaluation backend is unreachable. Recording warning and leaving the scheduled workflow green."
+              jq '. + {skipped_reason: "backend_unreachable"}' /tmp/eval_summary.json > /tmp/eval_summary.tmp
+              mv /tmp/eval_summary.tmp /tmp/eval_summary.json
+              exit 0
+            fi
+            echo "::error::Backend returned HTTP ${http_code:-0}. See response body above for details."
+            echo "Response: ${response}"
+            exit 1
+          fi
+
+          if [ "${response_is_json}" != "true" ]; then
+            echo "::error::Backend returned a successful HTTP status but the response body was not valid JSON."
+            echo "Response: ${response}"
+            exit 1
+          fi
+
+          if [ -z "${total_evaluated}" ] || [ "${total_evaluated}" = "0" ]; then
+            echo "::error::Scheduled evaluation completed without evaluating any dataset questions."
+            if [ -n "${result_message}" ]; then
+              echo "Message: ${result_message}"
+            fi
+            exit 1
+          fi
+
+          if [ "${quality_summary_type}" = "null" ]; then
+            echo "::error::Scheduled evaluation returned no quality summary."
+            if [ -n "${result_message}" ]; then
+              echo "Message: ${result_message}"
+            fi
+            exit 1
+          fi
+
+          if awk "BEGIN {exit !(${avg_correctness:-0} < ${MIN_AVG_CORRECTNESS})}"; then
+            if [ "${enforce_quality_gates}" = "true" ]; then
+              echo "::error::Average correctness ${avg_correctness:-0} is below required threshold ${MIN_AVG_CORRECTNESS}."
+              exit 1
+            fi
+            echo "::warning::Average correctness ${avg_correctness:-0} is below advisory threshold ${MIN_AVG_CORRECTNESS}."
+          fi
+
+          if awk "BEGIN {exit !(${avg_context_recall:-0} < ${MIN_AVG_CONTEXT_RECALL})}"; then
+            if [ "${enforce_quality_gates}" = "true" ]; then
+              echo "::error::Average context recall ${avg_context_recall:-0} is below required threshold ${MIN_AVG_CONTEXT_RECALL}."
+              exit 1
+            fi
+            echo "::warning::Average context recall ${avg_context_recall:-0} is below advisory threshold ${MIN_AVG_CONTEXT_RECALL}."
+          fi
+
+          if [ "${drift_summary_type}" = "object" ] && [ -n "${avg_drift_score}" ] && awk "BEGIN {exit !(${avg_drift_score:-0} > ${MAX_AVG_DRIFT_SCORE})}"; then
+            if [ "${enforce_quality_gates}" = "true" ]; then
+              echo "::error::Average drift score ${avg_drift_score:-0} exceeds maximum allowed threshold ${MAX_AVG_DRIFT_SCORE}."
+              exit 1
+            fi
+            echo "::warning::Average drift score ${avg_drift_score:-0} exceeds advisory threshold ${MAX_AVG_DRIFT_SCORE}."
+          fi
+
+          echo "Result   : dataset=${dataset_path:-unknown}, total_evaluated=${total_evaluated}/${total_dataset_questions:-unknown}, avg_latency=${avg_latency:-unknown}s"
+          if [ "${quality_summary_type}" = "object" ]; then
+            echo "Quality  : faithfulness=${avg_faithfulness:-unknown}, answer_relevance=${avg_answer_relevance:-unknown}, context_recall=${avg_context_recall:-unknown}, context_precision=${avg_context_precision:-unknown}, correctness=${avg_correctness:-unknown}"
+          fi
+          if [ "${drift_summary_type}" = "object" ]; then
+            echo "Drift    : avg=${avg_drift_score:-unknown}, max=${max_drift_score:-unknown}, high_drift_count=${high_drift_count:-unknown}"
+          fi
+          echo "✓ Evaluation triggered successfully (HTTP ${http_code})."
+
+      - name: Revoke temporary SSH ingress
+        if: always()
+        run: scripts/ci/revoke_ec2_ssh_ingress.sh
+
+      - name: Upload evaluation response artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-evaluation-response-${{ github.run_id }}
+          path: |
+            /tmp/eval_response.json
+            /tmp/eval_final_result.json
+            /tmp/eval_summary.json
+          if-no-files-found: ignore
+
+  notify-rag-evaluation:
+    name: Notify RAG Evaluation Result
+    runs-on: ubuntu-latest
+    needs: [run-dataset-evaluation]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - name: Download evaluation artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rag-evaluation-response-${{ github.run_id }}
+          path: /tmp
+
+      - name: Resolve quality metrics
+        id: notify-vars
+        run: |
+          set -euo pipefail
+
+          eval_result="${{ needs.run-dataset-evaluation.result }}"
+          overall_status="success"
+          quality_gate="PASSED"
+          notify_message=":white_check_mark: *RAG evaluation completed*"
+          failure_detail=""
+          skipped_reason=""
+          http_code="unknown"
+          response_source="unknown"
+          avg_correctness="unknown"
+          avg_context_recall="unknown"
+          avg_drift_score="unknown"
+          total_evaluated="unknown"
+          avg_c=""
+
+          if [ -f /tmp/eval_summary.json ]; then
+            http_code="$(jq -r '.http_code // "unknown"' /tmp/eval_summary.json 2>/dev/null || echo "unknown")"
+            skipped_reason="$(jq -r '.skipped_reason // empty' /tmp/eval_summary.json 2>/dev/null || true)"
+            response_source="$(jq -r '.response_source // "unknown"' /tmp/eval_summary.json 2>/dev/null || echo "unknown")"
+            avg_c="$(jq -r '.response.quality_summary.avg_correctness // empty' /tmp/eval_summary.json 2>/dev/null || true)"
+            avg_correctness="$(jq -r '.response.quality_summary.avg_correctness // "unknown"' /tmp/eval_summary.json 2>/dev/null || echo "unknown")"
+            avg_context_recall="$(jq -r '.response.quality_summary.avg_context_recall // "unknown"' /tmp/eval_summary.json 2>/dev/null || echo "unknown")"
+            avg_drift_score="$(jq -r '.response.drift_summary.avg_drift_score // "unknown"' /tmp/eval_summary.json 2>/dev/null || echo "unknown")"
+            total_evaluated="$(jq -r '.response.total_evaluated // "unknown"' /tmp/eval_summary.json 2>/dev/null || echo "unknown")"
+          fi
+
+          if [ -n "${skipped_reason}" ]; then
+            overall_status="warning"
+            quality_gate="SKIPPED"
+            printf -v notify_message ':warning: *RAG evaluation skipped*\nReason: `%s`. Quality gate: *%s*' \
+              "${skipped_reason}" \
+              "${quality_gate}"
+          elif [ "${eval_result}" = "failure" ]; then
+            overall_status="failure"
+            quality_gate="FAILED"
+            if [ "${http_code}" != "unknown" ]; then
+              failure_detail="Backend returned HTTP ${http_code} via ${response_source}."
+            else
+              failure_detail="Dataset evaluation job failed before metrics were available."
+            fi
+            printf -v notify_message ':x: *RAG evaluation FAILED*\n%s\nQuality gate: *%s*' \
+              "${failure_detail}" \
+              "${quality_gate}"
+          else
+            if [ -n "${avg_c}" ] && [ "${avg_c}" != "null" ] && [ "${avg_c}" != "unknown" ]; then
+              is_below="$(awk "BEGIN {print ("${avg_c}" < 0.55) ? 1 : 0}")"
+              if [ "${is_below}" -eq 1 ]; then
+                overall_status="warning"
+                quality_gate="BELOW_THRESHOLD"
+              fi
+            fi
+            if [ "${overall_status}" = "warning" ]; then
+              printf -v notify_message ':warning: *RAG evaluation completed below threshold*\nQuality gate: *%s* | Evaluated: %s questions' \
+                "${quality_gate}" \
+                "${total_evaluated}"
+            else
+              printf -v notify_message ':white_check_mark: *RAG evaluation completed*\nQuality gate: *%s* | Evaluated: %s questions' \
+                "${quality_gate}" \
+                "${total_evaluated}"
+            fi
+          fi
+
+          # Escape newlines in values before writing to GITHUB_OUTPUT
+          # (multiline values are not supported in workflow commands format)
+          escape() {
+            printf '%s' "$1" | tr '\n' ' ' | sed 's/  */ /g' | sed 's/ $//'
+          }
+
+          echo "status=$(escape "${overall_status}")" >> "$GITHUB_OUTPUT"
+          echo "quality_gate=$(escape "${quality_gate}")" >> "$GITHUB_OUTPUT"
+          echo "avg_correctness=$(escape "${avg_correctness}")" >> "$GITHUB_OUTPUT"
+          echo "avg_context_recall=$(escape "${avg_context_recall}")" >> "$GITHUB_OUTPUT"
+          echo "avg_drift_score=$(escape "${avg_drift_score}")" >> "$GITHUB_OUTPUT"
+          echo "total_evaluated=$(escape "${total_evaluated}")" >> "$GITHUB_OUTPUT"
+          echo "http_code=$(escape "${http_code}")" >> "$GITHUB_OUTPUT"
+          echo "response_source=$(escape "${response_source}")" >> "$GITHUB_OUTPUT"
+          {
+            echo "message<<EOF"
+            printf '%s\n' "${notify_message}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout for Slack notify
+        if: always()
+        uses: actions/checkout@v4
+
+      - name: Notify #smart-tutor-ai
+        if: always()
+        uses: ./.github/actions/send-slack-notification
+        with:
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL_SMART_TUTOR_AI }}
+          workflow_name: Scheduled RAG Evaluation
+          status: ${{ steps.notify-vars.outputs.status }}
+          verbiage: RAG Eval
+          message: ${{ steps.notify-vars.outputs.message }}
+          fields: >-
+            [
+              {"title": "HTTP Status", "value": "${{ steps.notify-vars.outputs.http_code }}", "short": true},
+              {"title": "Response Source", "value": "${{ steps.notify-vars.outputs.response_source }}", "short": true},
+              {"title": "Avg Correctness", "value": "${{ steps.notify-vars.outputs.avg_correctness }}", "short": true},
+              {"title": "Avg Context Recall", "value": "${{ steps.notify-vars.outputs.avg_context_recall }}", "short": true},
+              {"title": "Avg Drift Score", "value": "${{ steps.notify-vars.outputs.avg_drift_score }}", "short": true},
+              {"title": "Total Evaluated", "value": "${{ steps.notify-vars.outputs.total_evaluated }}", "short": true},
+              {"title": "Quality Gate", "value": "${{ steps.notify-vars.outputs.quality_gate }}", "short": true},
+              {"title": "Trigger", "value": "${{ github.event_name }}", "short": true}
+            ]
+
+      - name: Notify #app-development-analytics
+        if: always()
+        uses: ./.github/actions/send-slack-notification
+        with:
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS }}
+          workflow_name: Scheduled RAG Evaluation
+          status: ${{ steps.notify-vars.outputs.status }}
+          verbiage: RAG Eval
+          message: ${{ steps.notify-vars.outputs.message }}
+          fields: >-
+            [
+              {"title": "HTTP Status", "value": "${{ steps.notify-vars.outputs.http_code }}", "short": true},
+              {"title": "Response Source", "value": "${{ steps.notify-vars.outputs.response_source }}", "short": true},
+              {"title": "Avg Correctness", "value": "${{ steps.notify-vars.outputs.avg_correctness }}", "short": true},
+              {"title": "Avg Context Recall", "value": "${{ steps.notify-vars.outputs.avg_context_recall }}", "short": true},
+              {"title": "Avg Drift Score", "value": "${{ steps.notify-vars.outputs.avg_drift_score }}", "short": true},
+              {"title": "Total Evaluated", "value": "${{ steps.notify-vars.outputs.total_evaluated }}", "short": true},
+              {"title": "Quality Gate", "value": "${{ steps.notify-vars.outputs.quality_gate }}", "short": true},
+              {"title": "Trigger", "value": "${{ github.event_name }}", "short": true}
+            ]

@@ -1,0 +1,575 @@
+name: Production Observability Bootstrap
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekdays only, 90 minutes after the 09:00 America/Chicago EC2 start
+    # (see ec2-schedule.yml) so the app has finished booting. 15:30 UTC is
+    # 10:30 AM during CDT and 9:30 AM during CST — inside business hours
+    # either way, so no DST-specific cron entries are needed.
+    - cron: '30 15 * * 1-5'
+
+concurrency:
+  group: production-observability
+  cancel-in-progress: false
+
+jobs:
+  observability:
+    name: Deploy Monitoring Stack On EC2
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      skipped_reason: ${{ steps.bootstrap.outputs.skipped_reason }}
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID || vars.EC2_INSTANCE_ID || '' }}
+      EC2_INSTANCE_NAME: ${{ vars.EC2_INSTANCE_NAME || '' }}
+      EC2_AUTO_START: ${{ vars.EC2_AUTO_START || 'true' }}
+      EC2_TEMPORARY_SSH_INGRESS: ${{ vars.EC2_TEMPORARY_SSH_INGRESS || 'true' }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+      GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+      OBSERVABILITY_DIR: ${{ vars.EC2_OBSERVABILITY_DIR || '/home/ubuntu/smart-tutor-observability' }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY || '' }}
+      OBSERVABILITY_REQUIRE_EC2_SSH: ${{ vars.OBSERVABILITY_REQUIRE_EC2_SSH || 'false' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in EC2_USER EC2_SSH_KEY GRAFANA_ADMIN_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ -z "${EC2_HOST:-}" ] && [ -z "${EC2_INSTANCE_ID:-}" ] && [ -z "${EC2_INSTANCE_NAME:-}" ]; then
+            missing+=("EC2_HOST or EC2_INSTANCE_ID/EC2_INSTANCE_NAME")
+          fi
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required production observability configuration."
+            for item in "${missing[@]}"; do
+              echo "::error::Missing required secret ${item}"
+            done
+            exit 1
+          fi
+
+      - name: Install AWS CLI
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' && env.AWS_SECRET_ACCESS_KEY != '' }}
+        uses: unfor19/install-aws-cli-action@e8b481e524a99f37fbd39fdc1dcb3341ab091367  # v1.0.7
+
+      - name: Resolve production EC2 target
+        run: scripts/ci/resolve_ec2_target.sh
+
+      - name: Package observability files
+        run: |
+          set -euo pipefail
+          tar -czf /tmp/observability-bundle.tgz \
+            docker-compose.observability.yml \
+            monitoring/alertmanager/alertmanager.yml \
+            monitoring/prometheus/prometheus-ec2.yml \
+            monitoring/prometheus/alerts.yml \
+            monitoring/grafana/dashboards \
+            monitoring/grafana/datasources
+
+      - name: Bootstrap observability stack on EC2
+        id: bootstrap
+        run: |
+          set -euo pipefail
+
+          key_file="$(mktemp)"
+          trap 'rm -f "${key_file}"' EXIT
+          printf '%s\n' "${EC2_SSH_KEY}" > "${key_file}"
+          chmod 600 "${key_file}"
+          remote_observability_dir="$(printf '%q' "${OBSERVABILITY_DIR}")"
+          remote_grafana_password="$(printf '%q' "${GRAFANA_ADMIN_PASSWORD}")"
+          ssh_opts=(-o StrictHostKeyChecking=no -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=20 -o ConnectionAttempts=2 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o TCPKeepAlive=yes)
+
+          if ! ssh "${ssh_opts[@]}" -i "${key_file}" "${EC2_USER}@${EC2_HOST}" "printf 'ssh-ok\n'"; then
+            if [ "${{ github.event_name }}" = "schedule" ] && [ "$(printf '%s' "${OBSERVABILITY_REQUIRE_EC2_SSH}" | tr '[:upper:]' '[:lower:]')" != "true" ]; then
+              echo "::warning::Production EC2 is not reachable over SSH from the GitHub runner. Skipping scheduled observability bootstrap without failing the workflow."
+              echo "skipped_reason=ec2_ssh_unreachable" >> "$GITHUB_OUTPUT"
+              echo "OBSERVABILITY_SKIPPED_REASON=ec2_ssh_unreachable" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "::error::Unable to reach production EC2 over SSH. Verify the resolved host, instance state, and security group ingress for GitHub-hosted runners on port 22."
+            exit 1
+          fi
+
+          ssh "${ssh_opts[@]}" -i "${key_file}" "${EC2_USER}@${EC2_HOST}" "mkdir -p ${remote_observability_dir}"
+          scp "${ssh_opts[@]}" -i "${key_file}" /tmp/observability-bundle.tgz "${EC2_USER}@${EC2_HOST}:${remote_observability_dir}/observability-bundle.tgz"
+
+          ssh "${ssh_opts[@]}" -i "${key_file}" "${EC2_USER}@${EC2_HOST}" "OBSERVABILITY_DIR=${remote_observability_dir} GRAFANA_ADMIN_PASSWORD=${remote_grafana_password} bash -s" <<'EOF'
+          set -euo pipefail
+
+          OBS_DIR="${OBSERVABILITY_DIR:-/home/ubuntu/smart-tutor-observability}"
+          SMART_TUTOR_ENV_FILE="${SMART_TUTOR_ENV_FILE:-$HOME/smart-tutor.env}"
+          mkdir -p "${OBS_DIR}"
+          cd "${OBS_DIR}"
+
+          tar -xzf observability-bundle.tgz
+          rm -f observability-bundle.tgz
+
+          command -v docker >/dev/null
+          command -v curl >/dev/null
+          command -v python3 >/dev/null
+          docker compose version >/dev/null
+
+          if [ ! -f "${SMART_TUTOR_ENV_FILE}" ]; then
+            echo "Missing application environment file: ${SMART_TUTOR_ENV_FILE}"
+            exit 1
+          fi
+
+          set -a
+          . "${SMART_TUTOR_ENV_FILE}"
+          set +a
+
+          required_env=(
+            POSTGRES_HOST
+            POSTGRES_DB
+            POSTGRES_USER
+            POSTGRES_PASSWORD
+            REDIS_HOST
+            REDIS_PASSWORD
+          )
+          missing_env=()
+          for name in "${required_env[@]}"; do
+            if [ -z "${!name:-}" ]; then
+              missing_env+=("${name}")
+            fi
+          done
+          if [ ${#missing_env[@]} -gt 0 ]; then
+            echo "Missing required application observability settings in ${SMART_TUTOR_ENV_FILE}: ${missing_env[*]}"
+            exit 1
+          fi
+
+          if [ -n "${POSTGRES_SSLMODE:-}" ]; then
+            postgres_sslmode="${POSTGRES_SSLMODE}"
+          elif [ "${POSTGRES_HOST}" = "postgres" ] || [ "${POSTGRES_HOST}" = "localhost" ] || [ "${POSTGRES_HOST}" = "127.0.0.1" ]; then
+            postgres_sslmode="disable"
+          else
+            postgres_sslmode="require"
+          fi
+
+          if [ "${REDIS_SSL:-false}" = "true" ]; then
+            redis_exporter_address="rediss://${REDIS_HOST}:${REDIS_PORT:-6379}"
+          else
+            redis_exporter_address="redis://${REDIS_HOST}:${REDIS_PORT:-6379}"
+          fi
+
+          alertmanager_route_entries=""
+          alertmanager_receivers=$'receivers:\n  - name: "null"\n'
+          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+            alertmanager_route_entries+=$'    - receiver: "slack"\n      continue: true\n'
+            alertmanager_receivers+="$(
+              printf '%s\n' '  - name: "slack"'
+              printf '%s\n' '    slack_configs:'
+              printf '%s\n' "      - api_url: \"${SLACK_WEBHOOK_URL}\""
+              printf '%s\n' '        username: "Smart Tutor Alerts"'
+              printf '%s\n' '        icon_emoji: ":rotating_light:"'
+              printf '%s\n' '        send_resolved: true'
+              printf '%s\n' "        color: '{{ if eq .Status \"resolved\" }}good{{ else if eq .CommonLabels.severity \"critical\" }}danger{{ else }}warning{{ end }}'"
+              printf '%s\n' "        title: '[{{ .CommonLabels.severity | toUpper }}] {{ .CommonLabels.alertname }}'"
+              printf '%s\n' "        pretext: '{{ if eq .Status \"resolved\" }}Resolved{{ else }}Firing{{ end }} alert for Smart AI Tutor production'"
+              printf '%s\n' "        text: '{{ range .Alerts }}- *{{ .Annotations.summary }}*{{ if .Annotations.description }}\\n{{ .Annotations.description }}{{ end }}{{ \"\\n\" }}{{ end }}'"
+              printf '%s\n' '        fields:'
+              printf '%s\n' '          - title: "Environment"'
+              printf '%s\n' "            value: '{{ .CommonLabels.environment }}'"
+              printf '%s\n' '            short: true'
+              printf '%s\n' '          - title: "Component"'
+              printf '%s\n' "            value: '{{ .CommonLabels.component }}'"
+              printf '%s\n' '            short: true'
+              printf '%s\n' '          - title: "Status"'
+              printf '%s\n' "            value: '{{ .Status }}'"
+              printf '%s\n' '            short: true'
+              printf '%s\n' '          - title: "Alert Count"'
+              printf '%s\n' "            value: '{{ len .Alerts }}'"
+              printf '%s\n' '            short: true'
+              printf '%s\n' "        footer: 'Alertmanager via Production Observability'"
+              printf '%s\n' '        mrkdwn_in:'
+              printf '%s\n' '          - pretext'
+              printf '%s\n' '          - text'
+            )"
+            alertmanager_receivers+=$'\n'
+          fi
+
+          if [ -n "${ALERTS_EMAIL_TO:-${EMAIL_FROM:-}}" ] && [ -n "${SMTP_SERVER:-}" ] && [ -n "${SMTP_USERNAME:-}" ] && [ -n "${SMTP_PASSWORD:-}" ]; then
+            alert_email_to="${ALERTS_EMAIL_TO:-${EMAIL_FROM}}"
+            alertmanager_route_entries+=$'    - receiver: "email"\n      continue: true\n'
+            alertmanager_receivers+="$(
+              printf '%s\n' '  - name: "email"'
+              printf '%s\n' '    email_configs:'
+              printf '%s\n' "      - to: \"${alert_email_to}\""
+              printf '%s\n' "        from: \"${EMAIL_FROM:-${SMTP_USERNAME}}\""
+              printf '%s\n' "        smarthost: \"${SMTP_SERVER}:${SMTP_PORT:-587}\""
+              printf '%s\n' "        auth_username: \"${SMTP_USERNAME}\""
+              printf '%s\n' "        auth_password: \"${SMTP_PASSWORD}\""
+              printf '%s\n' '        require_tls: true'
+              printf '%s\n' '        send_resolved: true'
+            )"
+            alertmanager_receivers+=$'\n'
+          fi
+
+          if [ -n "${alertmanager_route_entries}" ]; then
+            alertmanager_routes_block=$(printf '  routes:\n%s' "${alertmanager_route_entries}")
+          else
+            alertmanager_routes_block=""
+          fi
+
+          cat > .env.observability <<ENVFILE
+          GRAFANA_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+          GRAFANA_PORT_EXPOSE=3001
+          GRAFANA_ROOT_URL=http://localhost:3001
+          POSTGRES_HOST=${POSTGRES_HOST}
+          POSTGRES_PORT=${POSTGRES_PORT:-5432}
+          POSTGRES_DB=${POSTGRES_DB}
+          POSTGRES_USER=${POSTGRES_USER}
+          POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+          POSTGRES_SSLMODE=${postgres_sslmode}
+          REDIS_EXPORTER_ADDRESS=${redis_exporter_address}
+          REDIS_PASSWORD=${REDIS_PASSWORD}
+          ENVFILE
+
+          {
+            printf '%s\n' 'global:'
+            printf '%s\n' '  resolve_timeout: 5m'
+            printf '%s\n' 'route:'
+            printf '%s\n' '  receiver: "null"'
+            printf '%s\n' '  group_by: ["alertname", "component", "severity"]'
+            printf '%s\n' '  group_wait: 30s'
+            printf '%s\n' '  group_interval: 5m'
+            printf '%s\n' '  repeat_interval: 4h'
+            if [ -n "${alertmanager_routes_block}" ]; then
+              printf '%s\n' "${alertmanager_routes_block}"
+            fi
+            printf '\n'
+            printf '%s\n' "${alertmanager_receivers}"
+          } > monitoring/alertmanager/alertmanager.yml
+
+          docker network inspect smart-tutor_smart-tutor-network >/dev/null 2>&1 || \
+            docker network create smart-tutor_smart-tutor-network
+
+          compose_cmd=(docker compose --env-file .env.observability -f docker-compose.observability.yml)
+
+          wait_http() {
+            local name="$1"
+            local url="$2"
+            local attempts="${3:-30}"
+            local sleep_seconds="${4:-5}"
+
+            for attempt in $(seq 1 "${attempts}"); do
+              if curl -fsS "${url}" >/dev/null; then
+                echo "[PASS] ${name} ready: ${url}"
+                return 0
+              fi
+              echo "[WAIT] ${name} not ready yet (${attempt}/${attempts}): ${url}"
+              sleep "${sleep_seconds}"
+            done
+
+            echo "[FAIL] ${name} did not become ready: ${url}"
+            return 1
+          }
+
+          dump_diagnostics() {
+            echo ""
+            echo "=== docker compose ps ==="
+            "${compose_cmd[@]}" ps || true
+            echo ""
+            echo "=== docker compose logs (last 200 lines) ==="
+            "${compose_cmd[@]}" logs --tail=200 || true
+          }
+
+          start_heartbeat() {
+            (
+              while true; do
+                sleep 60
+                echo "[KEEPALIVE] Observability bootstrap still running at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              done
+            ) &
+            heartbeat_pid="$!"
+          }
+
+          stop_heartbeat() {
+            if [ -n "${heartbeat_pid:-}" ]; then
+              kill "${heartbeat_pid}" 2>/dev/null || true
+              wait "${heartbeat_pid}" 2>/dev/null || true
+            fi
+          }
+          trap stop_heartbeat EXIT
+
+          require_prometheus_target_health() {
+            local expected_jobs_csv="$1"
+            local attempts="${2:-12}"
+            local sleep_seconds="${3:-5}"
+            local payload
+
+            for attempt in $(seq 1 "${attempts}"); do
+              payload="$(curl -fsS "http://127.0.0.1:9090/api/v1/targets")"
+              if TARGET_PAYLOAD="${payload}" EXPECTED_JOBS="${expected_jobs_csv}" python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          payload = json.loads(os.environ["TARGET_PAYLOAD"])
+          expected = [job for job in os.environ["EXPECTED_JOBS"].split(",") if job]
+          active = payload.get("data", {}).get("activeTargets", [])
+          health_by_job = {}
+          for target in active:
+              labels = target.get("labels", {})
+              job = labels.get("job")
+              if not job:
+                  continue
+              health_by_job.setdefault(job, set()).add(target.get("health"))
+
+          missing = [job for job in expected if job not in health_by_job]
+          unhealthy = [
+              job for job in expected
+              if job in health_by_job and health_by_job[job] != {"up"}
+          ]
+          if missing or unhealthy:
+              if missing:
+                  print(f"Missing Prometheus targets: {', '.join(missing)}")
+              if unhealthy:
+                  print(f"Unhealthy Prometheus targets: {', '.join(unhealthy)}")
+              sys.exit(1)
+
+          print("Validated Prometheus targets:", ", ".join(expected))
+          PY
+              then
+                return 0
+              fi
+
+              echo "[WAIT] Prometheus targets not healthy yet (${attempt}/${attempts})"
+              sleep "${sleep_seconds}"
+            done
+
+            return 1
+          }
+
+          require_backend_observability_health() {
+            local expected_components_csv="$1"
+            local attempts="${2:-4}"
+            local sleep_seconds="${3:-15}"
+            local backend_port="${BACKEND_PORT_EXPOSE:-8010}"
+            local backend_health_url="http://127.0.0.1:${backend_port}/health/detailed"
+            local payload
+
+            for attempt in $(seq 1 "${attempts}"); do
+              if ! payload="$(curl -fsS "${backend_health_url}")"; then
+                echo "[WAIT] Backend detailed health not ready yet (${attempt}/${attempts}): ${backend_health_url}"
+                sleep "${sleep_seconds}"
+                continue
+              fi
+
+              if BACKEND_HEALTH_PAYLOAD="${payload}" EXPECTED_COMPONENTS="${expected_components_csv}" python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          payload = json.loads(os.environ["BACKEND_HEALTH_PAYLOAD"])
+          expected = [component for component in os.environ["EXPECTED_COMPONENTS"].split(",") if component]
+          checks = payload.get("checks", {})
+
+          missing = [component for component in expected if component not in checks]
+          invalid = {}
+          for component in expected:
+              details = checks.get(component, {})
+              status = details.get("status", "missing")
+              if status != "healthy":
+                  invalid[component] = status
+
+          if missing or invalid:
+              if missing:
+                  print(f"Missing backend observability checks: {', '.join(missing)}")
+              if invalid:
+                  details = ", ".join(f"{name}={status}" for name, status in invalid.items())
+                  print(f"Unhealthy backend observability components: {details}")
+              sys.exit(1)
+
+          statuses = ", ".join(f"{component}={checks[component].get('status')}" for component in expected)
+          print(f"Validated backend observability components: {statuses}")
+          PY
+              then
+                return 0
+              fi
+
+              echo "[WAIT] Backend observability components not healthy yet (${attempt}/${attempts})"
+              sleep "${sleep_seconds}"
+            done
+
+            return 1
+          }
+
+          validate_external_observability_hosts() {
+            local langfuse_enabled="${LANGFUSE_ENABLED:-false}"
+            local langfuse_host="${LANGFUSE_HOST:-https://cloud.langfuse.com}"
+            local posthog_enabled="${POSTHOG_ENABLED:-true}"
+            local posthog_host="${POSTHOG_HOST:-https://us.i.posthog.com}"
+            local http_code
+
+            if [ "${langfuse_enabled}" != "true" ]; then
+              echo "[FAIL] Langfuse must be enabled in ${SMART_TUTOR_ENV_FILE} for production observability"
+              return 1
+            fi
+
+            http_code="$(curl -sS -o /dev/null -I -w '%{http_code}' --max-time 10 "${langfuse_host}")" || {
+              echo "[FAIL] Langfuse host is unreachable: ${langfuse_host}"
+              return 1
+            }
+            if [ "${http_code}" = "000" ] || [ "${http_code}" -ge 500 ]; then
+              echo "[FAIL] Langfuse host returned HTTP ${http_code}: ${langfuse_host}"
+              return 1
+            fi
+            echo "[PASS] Langfuse host reachable: ${langfuse_host} (HTTP ${http_code})"
+
+            if [ "${posthog_enabled}" != "true" ]; then
+              echo "[FAIL] PostHog must be enabled in ${SMART_TUTOR_ENV_FILE} for production observability"
+              return 1
+            fi
+
+            http_code="$(curl -sS -o /dev/null -I -w '%{http_code}' --max-time 10 "${posthog_host}")" || {
+              echo "[FAIL] PostHog host is unreachable: ${posthog_host}"
+              return 1
+            }
+            if [ "${http_code}" = "000" ] || [ "${http_code}" -ge 500 ]; then
+              echo "[FAIL] PostHog host returned HTTP ${http_code}: ${posthog_host}"
+              return 1
+            fi
+            echo "[PASS] PostHog host reachable: ${posthog_host} (HTTP ${http_code})"
+          }
+
+          start_heartbeat
+          "${compose_cmd[@]}" up -d --remove-orphans
+          stop_heartbeat
+
+          # Prometheus and Alertmanager read bind-mounted config files only at startup.
+          # Restart them so each bootstrap run picks up the freshly rendered config.
+          "${compose_cmd[@]}" restart prometheus alertmanager
+
+          if ! wait_http "Prometheus" "http://127.0.0.1:9090/-/ready" 36 5; then
+            dump_diagnostics
+            exit 1
+          fi
+          if ! wait_http "Grafana" "http://127.0.0.1:3001/api/health" 36 5; then
+            dump_diagnostics
+            exit 1
+          fi
+          if ! wait_http "Alertmanager" "http://127.0.0.1:9093/-/healthy" 24 5; then
+            dump_diagnostics
+            exit 1
+          fi
+          if ! wait_http "Postgres Exporter" "http://127.0.0.1:9187/metrics" 24 5; then
+            dump_diagnostics
+            exit 1
+          fi
+          if ! wait_http "Redis Exporter" "http://127.0.0.1:9121/metrics" 24 5; then
+            dump_diagnostics
+            exit 1
+          fi
+          if ! wait_http "Node Exporter" "http://127.0.0.1:9100/metrics" 24 5; then
+            dump_diagnostics
+            exit 1
+          fi
+          if ! wait_http "cAdvisor" "http://127.0.0.1:8080/metrics" 24 5; then
+            dump_diagnostics
+            exit 1
+          fi
+
+          if ! require_prometheus_target_health "prometheus,backend-api,postgresql,redis,node,cadvisor"; then
+            dump_diagnostics
+            exit 1
+          fi
+          if ! require_backend_observability_health "langfuse,posthog"; then
+            dump_diagnostics
+            exit 1
+          fi
+          if ! validate_external_observability_hosts; then
+            dump_diagnostics
+            exit 1
+          fi
+
+          "${compose_cmd[@]}" ps
+          EOF
+
+      - name: Revoke temporary SSH ingress
+        if: always()
+        run: scripts/ci/revoke_ec2_ssh_ingress.sh
+
+      - name: Summary
+        run: |
+          {
+            echo "## Production Observability"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Workflow trigger | \`${{ github.event_name }}\` |"
+            echo "| Target host | \`${EC2_HOST}\` |"
+            echo "| Remote directory | \`${OBSERVABILITY_DIR}\` |"
+            echo "| Bundle file | \`docker-compose.observability.yml\` |"
+            echo "| Config source | \`~/smart-tutor.env\` on EC2 |"
+            echo "| Skipped reason | \`${OBSERVABILITY_SKIPPED_REASON:-none}\` |"
+            echo "| Services | \`prometheus\`, \`grafana\`, \`alertmanager\`, \`postgres-exporter\`, \`redis-exporter\`, \`node-exporter\`, \`cadvisor\` |"
+            echo "| Validated HTTP checks | \`9090/-/ready\`, \`3001/api/health\`, \`9093/-/healthy\`, \`9187/metrics\`, \`9121/metrics\`, \`9100/metrics\`, \`8080/metrics\` |"
+            echo "| Validated Prometheus jobs | \`prometheus\`, \`backend-api\`, \`postgresql\`, \`redis\`, \`node\`, \`cadvisor\` |"
+            echo "| Validated backend observability | \`langfuse\`, \`posthog\` must be \`healthy\` via \`127.0.0.1:\${BACKEND_PORT_EXPOSE:-8010}/health/detailed\` |"
+            echo "| Validated external observability hosts | \`LANGFUSE_HOST\`, \`POSTHOG_HOST\` |"
+            echo ""
+            echo "Notifications:"
+            echo "- Slack alerts are enabled when \`SLACK_WEBHOOK_URL\` is present in \`~/smart-tutor.env\`."
+            echo "- Email alerts are enabled when \`ALERTS_EMAIL_TO\`, \`SMTP_SERVER\`, \`SMTP_USERNAME\`, and \`SMTP_PASSWORD\` are present."
+            echo "- When both are configured, Alertmanager fans out to both receivers."
+            echo "- Daily runs require both Langfuse and PostHog to be enabled and healthy."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify-observability-smart-tutor-ai:
+    name: Notify Observability Deploy (#smart-tutor-ai)
+    needs: [observability]
+    if: always()
+    uses: ./.github/workflows/_slack-notify.yml
+    secrets:
+      SLACK_WEBHOOK_URL_SMART_TUTOR_AI: ${{ secrets.SLACK_WEBHOOK_URL_SMART_TUTOR_AI }}
+      SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS: ${{ secrets.SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS }}
+    with:
+      channel: SMART_TUTOR_AI
+      workflow_name: Production Observability Bootstrap
+      status: ${{ needs.observability.outputs.skipped_reason != '' && 'warning' || (needs.observability.result == 'failure' && 'failure' || 'success') }}
+      verbiage: Observability
+      message: |
+        ${{ needs.observability.outputs.skipped_reason != '' && ':warning: *Observability bootstrap skipped* — production EC2 was not reachable over SSH from the scheduled runner.' || (needs.observability.result == 'failure' && ':x: *Observability bootstrap FAILED* — monitoring stack not deployed or backend observability checks failed.' || ':white_check_mark: *Observability bootstrap SUCCEEDED* — Prometheus, Grafana, Alertmanager, exporters, and backend Langfuse/PostHog checks are validated.') }}
+        Trigger: `${{ github.event_name }}`. Scheduled weekdays at 15:30 UTC.
+      fields: >-
+        [
+          {"title": "Remote Directory", "value": "${{ vars.EC2_OBSERVABILITY_DIR || '/home/ubuntu/smart-tutor-observability' }}", "short": true},
+          {"title": "Result", "value": "${{ needs.observability.result }}", "short": true},
+          {"title": "Grafana Port", "value": "3001", "short": true},
+          {"title": "Prometheus Port", "value": "9090", "short": true}
+        ]
+
+  notify-observability-app-development-analytics:
+    name: Notify Observability Deploy (#app-development-analytics)
+    needs: [observability]
+    if: always()
+    uses: ./.github/workflows/_slack-notify.yml
+    secrets:
+      SLACK_WEBHOOK_URL_SMART_TUTOR_AI: ${{ secrets.SLACK_WEBHOOK_URL_SMART_TUTOR_AI }}
+      SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS: ${{ secrets.SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS }}
+    with:
+      channel: APP_DEV_ANALYTICS
+      workflow_name: Production Observability Bootstrap
+      status: ${{ needs.observability.outputs.skipped_reason != '' && 'warning' || (needs.observability.result == 'failure' && 'failure' || 'success') }}
+      verbiage: Observability
+      message: |
+        ${{ needs.observability.outputs.skipped_reason != '' && ':warning: *Observability bootstrap skipped* — production EC2 was not reachable over SSH from the scheduled runner.' || (needs.observability.result == 'failure' && ':x: *Observability bootstrap FAILED*' || ':white_check_mark: *Observability bootstrap completed* — monitoring stack and backend observability checks deployed to EC2.') }}
+        Services: Prometheus, Grafana, Alertmanager, postgres-exporter, redis-exporter, node-exporter, cadvisor. Backend checks: Langfuse, PostHog.
+      fields: >-
+        [
+          {"title": "Remote Directory", "value": "${{ vars.EC2_OBSERVABILITY_DIR || '/home/ubuntu/smart-tutor-observability' }}", "short": true},
+          {"title": "Result", "value": "${{ needs.observability.result }}", "short": true},
+          {"title": "Grafana Port", "value": "3001", "short": true},
+          {"title": "Prometheus Port", "value": "9090", "short": true}
+        ]

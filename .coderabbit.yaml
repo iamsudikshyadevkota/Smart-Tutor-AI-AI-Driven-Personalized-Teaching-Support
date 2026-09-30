@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+reviews:
+  profile: chill
+  request_changes_workflow: true
+  high_level_summary: true
+  auto_title_placeholder: ""
+  review_status: true
+  poem: false
+  collapse_walkthrough: false
+  sequence_diagrams: true
+  show_variable_types: true
+  show_constants: true
+  show_function_arguments: true
+  show_timing: true

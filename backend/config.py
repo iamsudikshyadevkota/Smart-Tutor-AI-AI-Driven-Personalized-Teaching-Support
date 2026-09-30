@@ -1,0 +1,805 @@
+"""
+Configuration Management System
+Handles environment variables, settings, and secrets management.
+
+Cloud provider abstraction: secrets are fetched via the pluggable
+backend in ``backend.cloud.secrets`` (AWS Secrets Manager, env-only, etc.)
+controlled by the SECRETS_PROVIDER environment variable.
+"""
+
+import os
+from typing import Optional, Dict, Any
+from pathlib import Path
+from dotenv import load_dotenv
+import json
+import logging
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Secrets: fetched via pluggable backend (no top-level boto3 import)
+# ---------------------------------------------------------------------------
+_app_secrets = None
+_rds_credentials = None
+
+_environment = os.getenv("ENVIRONMENT", "development").lower()
+
+# Auto-select secrets provider: "aws" in production/staging, "env" otherwise
+_secrets_provider = os.getenv("SECRETS_PROVIDER", "").lower()
+if not _secrets_provider:
+    _secrets_provider = "aws" if _environment in ("production", "staging") else "env"
+    os.environ.setdefault("SECRETS_PROVIDER", _secrets_provider)
+
+if _secrets_provider == "aws":
+    logger.info("Fetching secrets via AWS Secrets Manager...")
+    try:
+        from backend.cloud.secrets import get_secrets_backend
+        _secrets = get_secrets_backend()
+        _app_secrets = _secrets.get_secret("smart-tutor/app/secrets")
+        _rds_credentials = _app_secrets
+        if _app_secrets:
+            logger.info("Secrets loaded from Secrets Manager (consolidated)")
+        else:
+            logger.warning("Secrets not found in Secrets Manager, falling back to .env")
+    except Exception as exc:
+        logger.warning("Could not load secrets backend: %s — falling back to .env", exc)
+else:
+    logger.info("Secrets provider: environment variables only (SECRETS_PROVIDER=%s)", _secrets_provider)
+
+
+class Config:
+    """Central configuration management for the application"""
+
+    # Application Settings
+    APP_NAME = "Smart AI Tutor"
+    APP_VERSION = "1.0.0"
+    DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+    ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+
+    # Security Settings
+    # SECURITY: No default for SECRET_KEY — must be explicitly set via env or Secrets Manager
+    SECRET_KEY = os.getenv("SECRET_KEY", "")
+    if not SECRET_KEY:
+        if _environment == "production":
+            raise RuntimeError(
+                "CRITICAL: SECRET_KEY environment variable is not set. "
+                "Application cannot start in production without a secure secret key."
+            )
+        else:
+            import secrets as _secrets_mod
+            SECRET_KEY = _secrets_mod.token_hex(32)
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "SECRET_KEY not set — generated an ephemeral random key for this process. "
+                "Set SECRET_KEY in .env to persist sessions across restarts."
+            )
+    # SECURITY: Reduced from 3600 to 900 seconds (15 minutes)
+    SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT", "900"))  # 15 minutes default
+    MAX_LOGIN_ATTEMPTS = int(os.getenv("MAX_LOGIN_ATTEMPTS", "5"))
+    LOCKOUT_DURATION = int(os.getenv("LOCKOUT_DURATION", "900"))  # 15 minutes
+    # SECURITY: Increased minimum password length from 8 to 12
+    PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "12"))
+    PASSWORD_REQUIRE_UPPERCASE = (
+        os.getenv("PASSWORD_REQUIRE_UPPERCASE", "true").lower() == "true"
+    )
+    PASSWORD_REQUIRE_LOWERCASE = (
+        os.getenv("PASSWORD_REQUIRE_LOWERCASE", "true").lower() == "true"
+    )
+    PASSWORD_REQUIRE_DIGIT = (
+        os.getenv("PASSWORD_REQUIRE_DIGIT", "true").lower() == "true"
+    )
+    PASSWORD_REQUIRE_SPECIAL = (
+        os.getenv("PASSWORD_REQUIRE_SPECIAL", "true").lower() == "true"
+    )
+    PASSWORD_RESET_TOKEN_TTL_SECONDS = int(
+        os.getenv("PASSWORD_RESET_TOKEN_TTL_SECONDS", "3600")
+    )
+    EMAIL_VERIFICATION_CODE_TTL_SECONDS = int(
+        os.getenv("EMAIL_VERIFICATION_CODE_TTL_SECONDS", "900")
+    )
+    PASSWORD_SETUP_TOKEN_TTL_SECONDS = int(
+        os.getenv("PASSWORD_SETUP_TOKEN_TTL_SECONDS", "900")
+    )
+    ALLOWED_REDIRECT_DOMAINS = os.getenv("ALLOWED_REDIRECT_DOMAINS", "").split(",")
+    CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+    CORS_ALLOW_LOCALHOST = os.getenv("CORS_ALLOW_LOCALHOST", "false").lower() == "true"
+
+    # JWT Settings - with AWS Secrets Manager support
+    JWT_SECRET_KEY = (
+        _app_secrets.get("jwt_secret_key")
+        if _app_secrets
+        else os.getenv("JWT_SECRET_KEY", SECRET_KEY)
+    )  # Separate key for JWT signing
+    JWT_ALGORITHM = os.getenv(
+        "JWT_ALGORITHM", "HS256"
+    )  # HS256 (symmetric) or RS256 (asymmetric)
+    # SECURITY: Reduced from 30 to 15 minutes
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(
+        os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "15")
+    )  # 15 minutes
+    JWT_REFRESH_TOKEN_EXPIRE_DAYS = int(
+        os.getenv("JWT_REFRESH_TOKEN_EXPIRE_DAYS", "7")
+    )  # 7 days
+    JWT_ISSUER = os.getenv("JWT_ISSUER", "smart-ai-tutor")
+    JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "smart-ai-tutor-api")
+
+    # RSA Keys for RS256 (asymmetric signing)
+    JWT_PRIVATE_KEY_PATH = os.getenv("JWT_PRIVATE_KEY_PATH", "keys/jwt_private.pem")
+    JWT_PUBLIC_KEY_PATH = os.getenv("JWT_PUBLIC_KEY_PATH", "keys/jwt_public.pem")
+
+    # Database Settings
+    STORAGE_BACKEND = os.getenv(
+        "STORAGE_BACKEND", "filesystem"
+    )  # Options: filesystem, postgres, dynamodb
+    USER_DATA_ROOT = os.getenv("USER_DATA_ROOT", "user_data")
+    LOGS_DIR = os.getenv("LOGS_DIR", "logs")
+    DATA_DIR = os.getenv("DATA_DIR", "data")
+    USERS_FILE = os.getenv("USERS_FILE", "users.json")
+    PREV_CHAT_DIR = os.getenv("PREV_CHAT_DIR", "previous_chats")
+    QUIZ_RESULTS_DIR = os.getenv("QUIZ_RESULTS_DIR", "quiz_results")
+
+    # PostgreSQL Settings (Phase 2) - with AWS Secrets Manager support
+    POSTGRES_HOST = (
+        _rds_credentials.get("host")
+        if _rds_credentials
+        else os.getenv("POSTGRES_HOST", "localhost")
+    )
+    POSTGRES_PORT = (
+        _rds_credentials.get("port")
+        if _rds_credentials
+        else int(os.getenv("POSTGRES_PORT", "5432"))
+    )
+    POSTGRES_DB = (
+        _rds_credentials.get("database")
+        if _rds_credentials
+        else os.getenv("POSTGRES_DB", "smart_tutor")
+    )
+    POSTGRES_USER = (
+        _rds_credentials.get("username")
+        if _rds_credentials
+        else os.getenv("POSTGRES_USER", "smart_tutor_user")
+    )
+    # SECURITY: No default for POSTGRES_PASSWORD — must be explicitly set
+    POSTGRES_PASSWORD = (
+        _rds_credentials.get("password")
+        if _rds_credentials
+        else os.getenv("POSTGRES_PASSWORD", "")
+    )
+    POSTGRES_MIN_CONNECTIONS = int(os.getenv("POSTGRES_MIN_CONNECTIONS", "2"))
+    POSTGRES_MAX_CONNECTIONS = int(os.getenv("POSTGRES_MAX_CONNECTIONS", "10"))
+    # SECURITY: PostgreSQL SSL settings
+    POSTGRES_SSL_MODE = os.getenv(
+        "POSTGRES_SSL_MODE", "require" if ENVIRONMENT == "production" else "prefer"
+    )
+    POSTGRES_SSL_ROOT_CERT = os.getenv(
+        "POSTGRES_SSL_ROOT_CERT", ""
+    )  # Path to CA certificate for RDS
+
+    # DynamoDB Settings (Phase 2) - Updated for AWS production deployment
+    DYNAMODB_ENDPOINT = os.getenv(
+        "DYNAMODB_ENDPOINT", ""
+    )  # Empty = AWS DynamoDB, set to http://localhost:8001 for local
+    DYNAMODB_REGION = os.getenv("DYNAMODB_REGION", os.getenv("AWS_REGION", "us-east-1"))
+    # Table names from Terraform outputs
+    DYNAMODB_TABLE_CHAT_SESSIONS = os.getenv(
+        "DYNAMODB_TABLE_CHAT_SESSIONS", f"smart-tutor-{ENVIRONMENT}-chat-sessions"
+    )
+    DYNAMODB_TABLE_USER_SESSIONS = os.getenv(
+        "DYNAMODB_TABLE_USER_SESSIONS", f"smart-tutor-{ENVIRONMENT}-user-sessions"
+    )
+    # AWS credentials - use IAM roles in ECS (preferred) or environment variables
+    AWS_ACCESS_KEY_ID = os.getenv(
+        "AWS_ACCESS_KEY_ID", ""
+    )  # Not needed when using IAM roles
+    AWS_SECRET_ACCESS_KEY = os.getenv(
+        "AWS_SECRET_ACCESS_KEY", ""
+    )  # Not needed when using IAM roles
+    AWS_SESSION_TOKEN = os.getenv(
+        "AWS_SESSION_TOKEN", ""
+    )  # Not needed when using IAM roles
+
+    # Redis Settings (Phase 3) - Updated for ElastiCache
+    REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+    REDIS_PORT = int(
+        os.getenv("REDIS_PORT", "6379")
+    )  # 6379 for production ElastiCache, 6380 for local dev
+    REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+    # Redis AUTH token from Secrets Manager or environment
+    REDIS_PASSWORD = (
+        _app_secrets.get("redis_auth_token")
+        if _app_secrets
+        else os.getenv("REDIS_PASSWORD", "")
+    )
+    # ElastiCache uses TLS in production
+    REDIS_SSL = (
+        os.getenv(
+            "REDIS_SSL", "true" if ENVIRONMENT == "production" else "false"
+        ).lower()
+        == "true"
+    )
+    REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "50"))
+    # Enable Redis in production, optional in dev
+    USE_REDIS_CACHE = (
+        os.getenv(
+            "USE_REDIS_CACHE", "true" if ENVIRONMENT == "production" else "false"
+        ).lower()
+        == "true"
+    )
+
+    # Cloud Provider Settings (Multi-Cloud Abstraction)
+    CLOUD_PROVIDER = os.getenv("CLOUD_PROVIDER", "aws")  # aws or local
+    OBJECT_STORAGE_PROVIDER = os.getenv("OBJECT_STORAGE_PROVIDER", "s3")  # s3 or local
+    SECRETS_PROVIDER = os.getenv("SECRETS_PROVIDER", _secrets_provider)  # aws or env
+
+    # AWS Bedrock Settings (Phase 4)
+    AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "bedrock")  # bedrock (prod) or ollama (local dev)
+    EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "bedrock")  # bedrock (prod) or ollama (local dev)
+
+    # Bedrock Models
+    BEDROCK_MODEL_ID = os.getenv(
+        "BEDROCK_MODEL_ID", "us.meta.llama3-1-70b-instruct-v1:0"
+    )
+    BEDROCK_EMBEDDING_MODEL_ID = os.getenv(
+        "BEDROCK_EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v2:0"
+    )
+
+    # Bedrock Guardrail: blocks jailbreak/prompt-injection attempts and
+    # harmful content, masks PII in model responses. Empty ID disables
+    # guardrail enforcement (e.g. local dev without one provisioned).
+    BEDROCK_GUARDRAIL_ID = os.getenv("BEDROCK_GUARDRAIL_ID", "")
+    BEDROCK_GUARDRAIL_VERSION = os.getenv("BEDROCK_GUARDRAIL_VERSION", "DRAFT")
+
+    # S3 Buckets - Updated for Terraform module naming convention
+    S3_UPLOADS_BUCKET = os.getenv(
+        "S3_UPLOADS_BUCKET", f"smart-tutor-{ENVIRONMENT}-uploads"
+    )
+    S3_VECTORS_BUCKET = os.getenv(
+        "S3_VECTORS_BUCKET", f"smart-tutor-{ENVIRONMENT}-vectors"
+    )
+    S3_BACKUPS_BUCKET = os.getenv(
+        "S3_BACKUPS_BUCKET", f"smart-tutor-{ENVIRONMENT}-backups"
+    )
+    S3_DOCUMENTS_BUCKET = os.getenv(
+        "S3_DOCUMENTS_BUCKET", "smart-ai-tutor-docs"
+    )  # For course documents
+    S3_VECTOR_INDEX_NAME = os.getenv(
+        "S3_VECTOR_INDEX_NAME", ""
+    )  # AWS S3 Vector Index name
+
+    # Vector Store Selection
+    USE_S3_VECTORS = (
+        os.getenv("USE_S3_VECTORS", "false").lower() == "true"
+    )  # Use S3 vectors instead of ChromaDB
+    USE_S3_VECTOR_INDEX = (
+        os.getenv("USE_S3_VECTOR_INDEX", "false").lower() == "true"
+    )  # Use AWS S3 Vector Index
+
+    # Bedrock Knowledge Base
+    BEDROCK_KB_ID = os.getenv("BEDROCK_KB_ID", "")
+    BEDROCK_KB_ENABLED = os.getenv("BEDROCK_KB_ENABLED", "false").lower() == "true"
+
+    # Cost Tracking
+    ENABLE_COST_TRACKING = os.getenv("ENABLE_COST_TRACKING", "true").lower() == "true"
+    COST_LOG_FILE = os.getenv("COST_LOG_FILE", "logs/bedrock_costs.jsonl")
+
+    # Enhanced RAG Master Toggle — when false, all enhancement features
+    # (query enhancement, reranking, self-RAG) are bypassed even if their
+    # individual flags are true.  Single kill-switch for the enhanced pipeline.
+    ENHANCED_RAG_ENABLED = os.getenv("ENHANCED_RAG_ENABLED", "false").lower() == "true"
+
+    # RAG & AI Settings
+    PERSIST_DIR = os.getenv("PERSIST_DIR", "./persisted_index")
+    CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
+    # Updated to BAAI/bge-small-en-v1.5 for better retrieval performance (Phase 1 improvement)
+    # Previous: sentence-transformers/all-MiniLM-L6-v2
+    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+    LLM_MODEL = os.getenv("LLM_MODEL", "llama3.2:latest")
+    LLM_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "120.0"))
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+
+    # Retrieval Settings
+    SIMILARITY_TOP_K = int(os.getenv("SIMILARITY_TOP_K", "3"))
+    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.3"))
+    # Optimized chunking: increased from 100 to 512 chars for better context (Phase 1 improvement)
+    CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "512"))
+    # Optimized overlap: increased to 20% of chunk size (102/512) for better continuity
+    CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "102"))
+
+    # Advanced Retrieval Settings (Phase 1 additions)
+    RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "5"))
+    MIN_RERANK_SCORE = float(os.getenv("MIN_RERANK_SCORE", "0.20"))
+
+    # Cross-Encoder Reranking — fetch more candidates, rerank, return top results
+    # Disabled by default: ms-marco cross-encoder underperforms cosine for educational content.
+    # Enable for web-search-style queries or after training a domain-specific model.
+    RERANKING_ENABLED = os.getenv("RERANKING_ENABLED", "false").lower() == "true"
+    RETRIEVAL_FETCH_K = int(os.getenv("RETRIEVAL_FETCH_K", "10"))  # Over-fetch count
+    RERANK_RETURN_K = int(os.getenv("RERANK_RETURN_K", "3"))  # Final results after reranking
+    RERANK_MODEL = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-12-v2")
+    MIN_RETRIEVAL_SCORE = float(os.getenv("MIN_RETRIEVAL_SCORE", "0.25"))  # Filter low-quality docs
+
+    # Query Expansion Settings (Phase 1)
+    QUERY_EXPANSION_ENABLED = (
+        os.getenv("QUERY_EXPANSION_ENABLED", "true").lower() == "true"
+    )
+    QUERY_EXPANSION_NUM = int(
+        os.getenv("QUERY_EXPANSION_NUM", "3")
+    )  # Generate 3 query variations
+
+    # Phase 2: Advanced RAG Settings
+    # Query Rewriting - Optimize queries before retrieval (+22 NDCG@3)
+    QUERY_REWRITING_ENABLED = (
+        os.getenv("QUERY_REWRITING_ENABLED", "true").lower() == "true"
+    )
+
+    # Self-RAG - Reflection mechanism for quality assessment (-52% hallucinations)
+    SELF_RAG_ENABLED = os.getenv("SELF_RAG_ENABLED", "true").lower() == "true"
+
+    # Corrective RAG (CRAG) - Enhanced quality threshold for web search triggering
+    CRAG_QUALITY_THRESHOLD = float(
+        os.getenv("CRAG_QUALITY_THRESHOLD", "0.5")
+    )  # 0.0-1.0 scale
+
+    # Evaluation Settings (Enabled by default for monitoring)
+    EVALUATION_ENABLED = (
+        os.getenv(
+            "EVALUATION_ENABLED",
+            "false" if ENVIRONMENT == "production" else "true",
+        ).lower()
+        == "true"
+    )
+    EVALUATION_LOG_FILE = os.getenv("EVALUATION_LOG_FILE", "logs/rag_evaluation.jsonl")
+    EVALUATION_RUNS_LOG_FILE = os.getenv(
+        "EVALUATION_RUNS_LOG_FILE", "logs/rag_evaluation_runs.jsonl"
+    )
+    EVALUATION_CRON_TOKEN = os.getenv("EVALUATION_CRON_TOKEN", "")
+    EVALUATION_DATASET_FILE = os.getenv(
+        "EVALUATION_DATASET_FILE", "backend/rag/tests/test_dataset.json"
+    )
+
+    # Phase 3: Context & Quality Improvements (2025-11-18) - DISABLED BY DEFAULT
+    # Note: These features provide +20-30% accuracy but increase computation time significantly
+    # Enable selectively in .env if needed for production workloads
+
+    # Recursive Chunking - Parent-child relationships for better context preservation.
+    # Retrieves small precise child chunks but feeds the LLM the larger parent
+    # context — measurably better on multi-paragraph reasoning in the eval harness.
+    # Default ON; set RECURSIVE_CHUNKING_ENABLED=false to revert to flat chunks.
+    RECURSIVE_CHUNKING_ENABLED = (
+        os.getenv("RECURSIVE_CHUNKING_ENABLED", "true").lower() == "true"
+    )
+    PARENT_CHUNK_SIZE = int(
+        os.getenv("PARENT_CHUNK_SIZE", "1024")
+    )  # Larger parent chunks (500-2000 tokens)
+    CHILD_CHUNK_SIZE = int(
+        os.getenv("CHILD_CHUNK_SIZE", "256")
+    )  # Smaller child chunks (100-500 tokens)
+    PARENT_CHUNK_OVERLAP = int(
+        os.getenv("PARENT_CHUNK_OVERLAP", "204")
+    )  # 20% of parent size
+    CHILD_CHUNK_OVERLAP = int(
+        os.getenv("CHILD_CHUNK_OVERLAP", "51")
+    )  # 20% of child size
+
+    # Contextual Enrichment - Add document metadata to chunks
+    CONTEXTUAL_ENRICHMENT_ENABLED = (
+        os.getenv("CONTEXTUAL_ENRICHMENT_ENABLED", "false").lower() == "true"
+    )
+    INCLUDE_DOC_TITLE = os.getenv("INCLUDE_DOC_TITLE", "true").lower() == "true"
+    INCLUDE_SECTION_HEADERS = (
+        os.getenv("INCLUDE_SECTION_HEADERS", "true").lower() == "true"
+    )
+    INCLUDE_PAGE_NUMBERS = os.getenv("INCLUDE_PAGE_NUMBERS", "true").lower() == "true"
+
+    # Response Diversity - MMR for reducing redundancy
+    MMR_ENABLED = os.getenv("MMR_ENABLED", "false").lower() == "true"
+    MMR_DIVERSITY_LAMBDA = float(
+        os.getenv("MMR_DIVERSITY_LAMBDA", "0.5")
+    )  # 0.0=max diversity, 1.0=max relevance
+    MMR_FETCH_K = int(
+        os.getenv("MMR_FETCH_K", "10")
+    )  # Fetch more candidates for MMR reranking
+
+    # Agentic Chunking - LLM-determined semantic boundaries (Experimental)
+    AGENTIC_CHUNKING_ENABLED = (
+        os.getenv("AGENTIC_CHUNKING_ENABLED", "false").lower() == "true"
+    )
+    AGENTIC_CHUNK_MIN_SIZE = int(os.getenv("AGENTIC_CHUNK_MIN_SIZE", "200"))
+    AGENTIC_CHUNK_MAX_SIZE = int(os.getenv("AGENTIC_CHUNK_MAX_SIZE", "800"))
+
+    # Web Search Settings - with AWS Secrets Manager support
+    WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() == "true"
+    SERPAPI_API_KEY = (
+        _app_secrets.get("serpapi_api_key")
+        if _app_secrets
+        else os.getenv("SERPAPI_API_KEY", "")
+    )
+    MAX_WEB_RESULTS = int(os.getenv("MAX_WEB_RESULTS", "3"))
+
+    # Langfuse Settings (for monitoring) - with AWS Secrets Manager support
+    LANGFUSE_ENABLED = os.getenv("LANGFUSE_ENABLED", "false").lower() == "true"
+    LANGFUSE_PUBLIC_KEY = (
+        _app_secrets.get("langfuse_public_key")
+        if _app_secrets
+        else os.getenv("LANGFUSE_PUBLIC_KEY", "")
+    )
+    LANGFUSE_SECRET_KEY = (
+        _app_secrets.get("langfuse_secret_key")
+        if _app_secrets
+        else os.getenv("LANGFUSE_SECRET_KEY", "")
+    )
+    LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+
+    # PostHog Settings (analytics + LLM cost tracking)
+    POSTHOG_ENABLED = os.getenv("POSTHOG_ENABLED", "true").lower() == "true"
+    POSTHOG_API_KEY = os.getenv("POSTHOG_API_KEY", "phc_SaDDOcIq1AnKzpCsRHHpmRoDX7b8IEXNlv8xtPXNn7c")
+    POSTHOG_HOST = os.getenv("POSTHOG_HOST", "https://us.i.posthog.com")
+
+    # Braintrust Settings (LLM observability, tracing, evals — Vercel Marketplace)
+    BRAINTRUST_API_KEY = os.getenv("BRAINTRUST_API_KEY", "")
+    BRAINTRUST_PROJECT = os.getenv("BRAINTRUST_PROJECT", "smart-ai-tutor")
+
+    # Google OAuth Settings - with AWS Secrets Manager support
+    GOOGLE_OAUTH_CLIENT_ID = (
+        _app_secrets.get("google_oauth_client_id")
+        if _app_secrets
+        else os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
+    )
+    GOOGLE_OAUTH_CLIENT_SECRET = (
+        _app_secrets.get("google_oauth_client_secret")
+        if _app_secrets
+        else os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
+    )
+    GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "")
+
+    # Email Settings
+    SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+    SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+    SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+    SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+    EMAIL_FROM = os.getenv("EMAIL_FROM", "")
+    ADMIN_NOTIFICATION_EMAILS = [
+        email.strip()
+        for email in os.getenv("ADMIN_NOTIFICATION_EMAILS", "").split(",")
+        if email.strip()
+    ]
+    USER_DATA_SHARED_STORAGE = (
+        os.getenv("USER_DATA_SHARED_STORAGE", "false").lower() == "true"
+    )
+
+    # Agent System (Multi-Agent LangGraph)
+    AGENT_SYSTEM_ENABLED = os.getenv("AGENT_SYSTEM_ENABLED", "false").lower() == "true"
+    AGENT_LLM_ROUTING_ENABLED = os.getenv("AGENT_LLM_ROUTING_ENABLED", "false").lower() == "true"
+    AGENT_DEFAULT_LEVEL = os.getenv("AGENT_DEFAULT_LEVEL", "intermediate")
+    AGENT_GRAPH_RECURSION_LIMIT = int(os.getenv("AGENT_GRAPH_RECURSION_LIMIT", "10"))
+
+    # Neo4j Knowledge Graph
+    NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+    # SECURITY: No default for NEO4J_PASSWORD — must be explicitly set
+    NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
+    NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
+
+    # Neo4j Aura API (for auto-resume of paused instances)
+    NEO4J_AURA_INSTANCE_ID = os.getenv("NEO4J_AURA_INSTANCE_ID", "")
+    NEO4J_AURA_API_CLIENT_ID = os.getenv("NEO4J_AURA_API_CLIENT_ID") or os.getenv("NEO4J_AURA_CLIENT_ID", "")
+    NEO4J_AURA_API_CLIENT_SECRET = os.getenv("NEO4J_AURA_API_CLIENT_SECRET") or os.getenv("NEO4J_AURA_CLIENT_SECRET", "")
+
+    # LLM Routing (Complexity-Based Model Selection)
+    LLM_ROUTING_ENABLED = os.getenv("LLM_ROUTING_ENABLED", "false").lower() == "true"
+    LLM_ROUTING_SIMPLE_MODEL = os.getenv("LLM_ROUTING_SIMPLE_MODEL", "")  # e.g. meta.llama3-8b-instruct-v1:0
+    LLM_ROUTING_COMPLEX_MODEL = os.getenv("LLM_ROUTING_COMPLEX_MODEL", "")  # falls back to BEDROCK_MODEL_ID
+    LLM_ROUTING_COMPLEXITY_THRESHOLD = float(os.getenv("LLM_ROUTING_COMPLEXITY_THRESHOLD", "0.5"))
+
+    # Cache Settings
+    CACHE_ENABLED = os.getenv("CACHE_ENABLED", "true").lower() == "true"
+    CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # 5 minutes default
+    CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "1000"))
+
+    # Answer Cache (Query→Answer caching with exact + fuzzy matching)
+    ANSWER_CACHE_ENABLED = os.getenv("ANSWER_CACHE_ENABLED", "false").lower() == "true"
+    ANSWER_CACHE_TTL = int(os.getenv("ANSWER_CACHE_TTL", "3600"))  # 1 hour
+    ANSWER_CACHE_FUZZY_THRESHOLD = float(os.getenv("ANSWER_CACHE_FUZZY_THRESHOLD", "0.95"))
+
+    # Redis Cache Settings (optional, falls back to in-memory if not available)
+    REDIS_ENABLED = os.getenv("REDIS_ENABLED", "false").lower() == "true"
+    REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+    REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+    REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+    REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
+    REDIS_SSL = os.getenv("REDIS_SSL", "false").lower() == "true"
+    REDIS_CONNECTION_TIMEOUT = int(os.getenv("REDIS_CONNECTION_TIMEOUT", "5"))  # seconds
+
+    # Rate Limiting
+    RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+    RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
+    RATE_LIMIT_PERIOD = int(os.getenv("RATE_LIMIT_PERIOD", "60"))  # seconds
+
+    # Per-User Rate Limiting (more restrictive, tracked by authenticated user)
+    RATE_LIMIT_PER_USER_REQUESTS = int(os.getenv("RATE_LIMIT_PER_USER_REQUESTS", "60"))
+    RATE_LIMIT_PER_USER_WINDOW = int(
+        os.getenv("RATE_LIMIT_PER_USER_WINDOW", "60")
+    )  # seconds
+
+    # Per-Model Rate Limiting (per user, per model family, per window)
+    MODEL_RATE_LIMIT_DEFAULT = int(os.getenv("MODEL_RATE_LIMIT_DEFAULT", "30"))
+    MODEL_RATE_LIMIT_FAST = int(os.getenv("MODEL_RATE_LIMIT_FAST", "30"))
+    MODEL_RATE_LIMIT_PRO = int(os.getenv("MODEL_RATE_LIMIT_PRO", "15"))
+    MODEL_RATE_LIMIT_ADMIN = int(os.getenv("MODEL_RATE_LIMIT_ADMIN", "5"))
+    MODEL_RATE_LIMIT_WINDOW = int(os.getenv("MODEL_RATE_LIMIT_WINDOW", "3600"))  # 1 hour
+
+    # Per-user daily Bedrock spend cap in USD. Request-count limits above
+    # bound *how often* a user can call the LLM, but not how much a single
+    # burst can cost -- this bounds actual dollars. 0 disables enforcement.
+    # Resets at UTC midnight (see rate_limiter.py's check_cost_budget).
+    DAILY_COST_BUDGET_USD = float(os.getenv("DAILY_COST_BUDGET_USD", "2.00"))
+
+    # Max concurrent LLM synthesis calls — backpressure for streaming chat
+    LLM_MAX_CONCURRENT = int(os.getenv("LLM_MAX_CONCURRENT", "10"))
+
+    # ──────────────────────────────────────────────────────────────────
+    # RAG evaluation tuning
+    # ──────────────────────────────────────────────────────────────────
+    # Per-subject context-precision thresholds. JSON object keyed by subject
+    # slug (lowercase). Use `default` for the fallback when no subject is
+    # provided. Empty / unset falls back to the builtin map in
+    # `backend.services.rag_quality_evaluator`.
+    #     CONTEXT_PRECISION_THRESHOLDS={"math":0.22,"history":0.45,"default":0.30}
+    @staticmethod
+    def _parse_precision_thresholds() -> Dict[str, float]:
+        import json as _json
+        raw = os.getenv("CONTEXT_PRECISION_THRESHOLDS", "")
+        if not raw.strip():
+            return {}
+        try:
+            parsed = _json.loads(raw)
+            if not isinstance(parsed, dict):
+                return {}
+            return {str(k).lower(): float(v) for k, v in parsed.items()}
+        except (ValueError, TypeError):
+            return {}
+
+    CONTEXT_PRECISION_THRESHOLDS: Dict[str, float] = _parse_precision_thresholds()
+
+    # LLM-judge mode: `combined` (1 LLM call/query, default) or `split`
+    # (4 calls/query — reduces position/halo bias for critical evals).
+    EVAL_JUDGE_MODE: str = os.getenv("EVAL_JUDGE_MODE", "combined").lower()
+
+    # Topic coverage scoring: `substring` (default, fast, brittle to synonyms)
+    # or `semantic` (Bedrock embedding cosine similarity per sentence,
+    # robust to paraphrase). Both modes also emit the substring metric for
+    # backwards compatibility with existing dashboards.
+    EVAL_TOPIC_COVERAGE_MODE: str = os.getenv("EVAL_TOPIC_COVERAGE_MODE", "substring").lower()
+    EVAL_TOPIC_COVERAGE_SIM_THRESHOLD: float = float(
+        os.getenv("EVAL_TOPIC_COVERAGE_SIM_THRESHOLD", "0.55")
+    )
+
+    # Monte Carlo production sampling — pull N random user queries from the
+    # chat store, replay them against the live pipeline, and emit quality
+    # metrics. Enabled by the scheduled workflow; runtime can opt out.
+    EVAL_PRODUCTION_SAMPLE_SIZE: int = int(os.getenv("EVAL_PRODUCTION_SAMPLE_SIZE", "20"))
+    EVAL_PRODUCTION_SAMPLE_LOOKBACK_HOURS: int = int(
+        os.getenv("EVAL_PRODUCTION_SAMPLE_LOOKBACK_HOURS", "168")  # 7 days
+    )
+
+    # Code Execution Feature Flag — off by default, must be explicitly enabled
+    # Set ENABLE_CODE_EXECUTION=true only in environments where sandboxed execution
+    # is intentionally exposed (e.g. a dedicated code-assistant deployment).
+    ENABLE_CODE_EXECUTION: bool = os.getenv("ENABLE_CODE_EXECUTION", "false").lower() == "true"
+
+    # HTTPS Enforcement
+    ENFORCE_HTTPS = (
+        os.getenv("ENFORCE_HTTPS", "false").lower() == "true"
+    )  # Enable in production
+
+    # File Upload Settings
+    MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", "10485760"))  # 10MB default
+    ALLOWED_EXTENSIONS = os.getenv(
+        "ALLOWED_EXTENSIONS", ".pdf,.docx,.pptx,.txt,.png,.jpg,.jpeg,.py,.ipynb"
+    ).split(",")
+
+    # Logging Settings
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    LOG_FILE = os.getenv("LOG_FILE", "logs/app.log")
+    LOG_FORMAT = os.getenv("LOG_FORMAT", "json")  # json or text
+    LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", "10485760"))  # 10MB
+    LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "5"))
+
+    # CloudWatch Logging (for ECS)
+    CLOUDWATCH_LOG_GROUP = os.getenv(
+        "CLOUDWATCH_LOG_GROUP", f"/aws/ecs/smart-tutor/{ENVIRONMENT}/backend"
+    )
+    ENABLE_CLOUDWATCH_LOGS = (
+        os.getenv(
+            "ENABLE_CLOUDWATCH_LOGS", "true" if ENVIRONMENT == "production" else "false"
+        ).lower()
+        == "true"
+    )
+
+    # LLM logging privacy controls
+    REDACT_LLM_LOGS = (
+        os.getenv(
+            "REDACT_LLM_LOGS", "true" if ENVIRONMENT == "production" else "false"
+        ).lower()
+        == "true"
+    )
+    DISABLE_LLM_LOG_CONTENT = (
+        os.getenv("DISABLE_LLM_LOG_CONTENT", "false").lower() == "true"
+    )
+    LLM_LOG_MAX_CHARS = int(os.getenv("LLM_LOG_MAX_CHARS", "2000"))
+
+    # Drift monitoring
+    DRIFT_MONITOR_ENABLED = (
+        os.getenv(
+            "DRIFT_MONITOR_ENABLED", "true" if ENVIRONMENT == "production" else "false"
+        ).lower()
+        == "true"
+    )
+    DRIFT_BASELINE_PATH = os.getenv("DRIFT_BASELINE_PATH", "./drift_baseline.json")
+
+    # Reproducibility manifest
+    REPRODUCIBILITY_ENABLED = (
+        os.getenv(
+            "REPRODUCIBILITY_ENABLED", "true" if ENVIRONMENT == "production" else "false"
+        ).lower()
+        == "true"
+    )
+    REPRODUCIBILITY_MANIFEST_PATH = os.getenv(
+        "REPRODUCIBILITY_MANIFEST_PATH", "./artifacts/reproducibility_manifest.json"
+    )
+
+    # Cold-start warmup
+    WARMUP_ENABLED = (
+        os.getenv(
+            "WARMUP_ENABLED", "false" if ENVIRONMENT == "development" else "true"
+        ).lower()
+        == "true"
+    )
+    WARMUP_LOAD_S3_INDEX = (
+        os.getenv("WARMUP_LOAD_S3_INDEX", "false").lower() == "true"
+    )
+    WARMUP_LOAD_RERANKER = (
+        os.getenv("WARMUP_LOAD_RERANKER", "false").lower() == "true"
+    )
+    WARMUP_TIMEOUT_SECONDS = int(os.getenv("WARMUP_TIMEOUT_SECONDS", "20"))
+
+    # ECS Metadata (auto-populated in ECS environment)
+    ECS_CONTAINER_METADATA_URI_V4 = os.getenv("ECS_CONTAINER_METADATA_URI_V4", "")
+    AWS_EXECUTION_ENV = os.getenv("AWS_EXECUTION_ENV", "")
+
+    @classmethod
+    def validate(cls) -> Dict[str, Any]:
+        """Validate configuration and return warnings/errors"""
+        warnings = []
+        errors = []
+
+        # CRITICAL: Production security validation
+        if cls.ENVIRONMENT == "production":
+            # JWT Secret validation
+            if not cls.JWT_SECRET_KEY:
+                errors.append(
+                    "CRITICAL: JWT_SECRET_KEY not set in production. "
+                    "Application cannot start without secure JWT secret. "
+                    "Set it via AWS Secrets Manager or environment variable."
+                )
+
+            # CORS validation
+            if not cls.CORS_ALLOWED_ORIGINS or cls.CORS_ALLOWED_ORIGINS == [""]:
+                errors.append(
+                    "CRITICAL: CORS_ALLOWED_ORIGINS must be set in production. "
+                    "Example: CORS_ALLOWED_ORIGINS=https://yourdomain.com,https://app.yourdomain.com"
+                )
+
+            # Database password validation
+            if cls.STORAGE_BACKEND in ["postgres", "hybrid"]:
+                if not cls.POSTGRES_PASSWORD:
+                    errors.append(
+                        "CRITICAL: POSTGRES_PASSWORD not set in production. "
+                        "Database password must be loaded from AWS Secrets Manager."
+                    )
+
+            # HTTPS enforcement validation
+            if not cls.ENFORCE_HTTPS:
+                warnings.append(
+                    "SECURITY: ENFORCE_HTTPS is disabled in production. "
+                    "This should be enabled for security."
+                )
+
+            # Warn about localhost in CORS
+            if cls.CORS_ALLOW_LOCALHOST:
+                warnings.append(
+                    "SECURITY: CORS_ALLOW_LOCALHOST is enabled in production. "
+                    "This should be disabled for security."
+                )
+
+            # Warn if LLM logs can capture raw user content in production
+            if not cls.REDACT_LLM_LOGS and not cls.DISABLE_LLM_LOG_CONTENT:
+                warnings.append(
+                    "SECURITY: LLM log content is not redacted in production. "
+                    "Consider setting REDACT_LLM_LOGS=true or DISABLE_LLM_LOG_CONTENT=true."
+                )
+
+            # Validate SECRET_KEY is set
+            if not cls.SECRET_KEY:
+                errors.append("SECRET_KEY must be set in production environment")
+
+            # Validate Neo4j password if agent system is enabled
+            if cls.AGENT_SYSTEM_ENABLED and not cls.NEO4J_PASSWORD:
+                errors.append(
+                    "CRITICAL: NEO4J_PASSWORD not set in production. "
+                    "Required when AGENT_SYSTEM_ENABLED=true."
+                )
+
+        if cls.LANGFUSE_ENABLED and (
+            not cls.LANGFUSE_PUBLIC_KEY or not cls.LANGFUSE_SECRET_KEY
+        ):
+            warnings.append("Langfuse is enabled but keys are missing")
+
+        if not cls.GOOGLE_OAUTH_CLIENT_ID or not cls.GOOGLE_OAUTH_CLIENT_SECRET:
+            warnings.append("Google OAuth credentials are not configured")
+
+        if cls.WEB_SEARCH_ENABLED and not cls.SERPAPI_API_KEY:
+            warnings.append("Web search is enabled but SERPAPI_API_KEY is missing")
+
+        # Create required directories
+        for directory in [
+            cls.USER_DATA_ROOT,
+            cls.PREV_CHAT_DIR,
+            cls.QUIZ_RESULTS_DIR,
+            cls.PERSIST_DIR,
+            cls.CHROMA_DB_PATH,
+        ]:
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except Exception as e:
+                errors.append(f"Failed to create directory {directory}: {e}")
+
+        # Create logs directory if needed
+        log_dir = os.path.dirname(cls.LOG_FILE)
+        if log_dir:
+            try:
+                os.makedirs(log_dir, exist_ok=True)
+            except Exception as e:
+                warnings.append(f"Failed to create log directory {log_dir}: {e}")
+
+        return {"valid": len(errors) == 0, "errors": errors, "warnings": warnings}
+
+    @classmethod
+    def to_dict(cls, include_secrets: bool = False) -> Dict[str, Any]:
+        """Export configuration as dictionary"""
+        config_dict = {}
+        for key, value in cls.__dict__.items():
+            if not key.startswith("_") and not callable(value):
+                # Mask secrets unless explicitly requested
+                if not include_secrets and any(
+                    secret in key.lower() for secret in ["key", "secret", "password"]
+                ):
+                    config_dict[key] = "***REDACTED***"
+                else:
+                    config_dict[key] = value
+        return config_dict
+
+    @classmethod
+    def get(cls, key: str, default: Any = None) -> Any:
+        """Get configuration value by key"""
+        return getattr(cls, key, default)
+
+
+# Singleton instance
+config = Config()
+
+
+def get_config() -> Config:
+    """Get the global configuration instance"""
+    return config
+
+
+def validate_config() -> Dict[str, Any]:
+    """Validate the current configuration"""
+    return config.validate()

@@ -1,0 +1,107 @@
+name: Neo4j Aura Resume Guard
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neo4j-aura-resume
+  cancel-in-progress: false
+
+jobs:
+  resume-aura:
+    name: Resume Neo4j Aura If Paused
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NEO4J_AURA_INSTANCE_ID: ${{ secrets.NEO4J_AURA_INSTANCE_ID || vars.NEO4J_AURA_INSTANCE_ID || '57036f35' }}
+      NEO4J_AURA_CLIENT_ID: ${{ secrets.NEO4J_AURA_CLIENT_ID || secrets.NEO4J_AURA_API_CLIENT_ID || secrets.AURA_CLIENT_ID || vars.NEO4J_AURA_CLIENT_ID || vars.NEO4J_AURA_API_CLIENT_ID || vars.AURA_CLIENT_ID || '' }}
+      NEO4J_AURA_CLIENT_SECRET: ${{ secrets.NEO4J_AURA_CLIENT_SECRET || secrets.NEO4J_AURA_API_CLIENT_SECRET || secrets.AURA_CLIENT_SECRET || '' }}
+      # Aura free-tier instances routinely take 7-12 minutes to resume from a
+      # paused state. Verified by PR #29: a real run timed out at 420s while
+      # the instance was still in `resuming`. 900s leaves headroom for cold
+      # starts; main's 420 was the old default.
+      NEO4J_AURA_POLL_TIMEOUT_SECONDS: ${{ vars.NEO4J_AURA_POLL_TIMEOUT_SECONDS || '900' }}
+      NEO4J_AURA_POLL_INTERVAL_SECONDS: ${{ vars.NEO4J_AURA_POLL_INTERVAL_SECONDS || '15' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resume paused Aura instance
+        id: resume
+        continue-on-error: true
+        run: |
+          set +e
+          python3 scripts/resume_neo4j_aura.py
+          rc=$?
+          echo "exit_code=${rc}" >> "$GITHUB_OUTPUT"
+          # Exit code 2 means the script ran but credentials are not configured
+          # yet. Treat that as a clean skip so the schedule does not page Slack.
+          if [ "${rc}" -eq 2 ]; then
+            echo "::warning::Neo4j Aura credentials not configured; skipping resume guard."
+            exit 0
+          fi
+          exit "${rc}"
+
+      - name: Notify deployment analytics when Aura was resumed
+        if: ${{ steps.resume.outcome == 'success' && steps.resume.outputs.action == 'resumed' }}
+        uses: ./.github/actions/send-slack-notification
+        with:
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS }}
+          workflow_name: Neo4j Aura Resume Guard
+          status: success
+          verbiage: Aura Resume
+          message: |
+            :white_check_mark: *Neo4j Aura instance resumed*
+            The scheduled guard resumed the paused AuraDB instance and waited until it was running.
+          fields: >-
+            [{"title":"Instance","value":"${{ steps.resume.outputs.instance_name || steps.resume.outputs.instance_id }}","short":true},{"title":"Status","value":"${{ steps.resume.outputs.status }}","short":true}]
+
+      - name: Notify deployment analytics when Aura resume failed
+        if: ${{ steps.resume.outcome != 'success' && steps.resume.outputs.action != 'configuration_missing' }}
+        uses: ./.github/actions/send-slack-notification
+        with:
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS }}
+          workflow_name: Neo4j Aura Resume Guard
+          status: failure
+          verbiage: Aura Resume
+          message: |
+            :x: *Neo4j Aura resume guard FAILED*
+            The application may fail Neo4j-backed features until the AuraDB instance is running.
+          fields: >-
+            [{"title":"Instance","value":"${{ steps.resume.outputs.instance_id || env.NEO4J_AURA_INSTANCE_ID }}","short":true},{"title":"Last status","value":"${{ steps.resume.outputs.status || 'unknown' }}","short":true},{"title":"Action","value":"${{ steps.resume.outputs.action || 'failed' }}","short":true}]
+          # Aura Resume Guard runs every 30 minutes. Suppress duplicate failure
+          # pages for the same instance+status within 4 hours so a multi-hour
+          # incident produces ~6 alerts, not ~8 per hour.
+          dedup_key: neo4j-aura-resume-${{ env.NEO4J_AURA_INSTANCE_ID }}
+          dedup_window_minutes: 240
+
+      - name: Notify deployment analytics when Aura credentials are missing
+        if: ${{ steps.resume.outcome != 'success' && steps.resume.outputs.action == 'configuration_missing' }}
+        uses: ./.github/actions/send-slack-notification
+        with:
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL_APP_DEV_ANALYTICS }}
+          workflow_name: Neo4j Aura Resume Guard
+          status: warning
+          verbiage: Aura Resume
+          message: |
+            :warning: *Neo4j Aura resume guard is not configured*
+            Add `NEO4J_AURA_CLIENT_ID` and `NEO4J_AURA_CLIENT_SECRET` repository secrets to let the guard resume paused AuraDB instances.
+          fields: >-
+            [{"title":"Instance","value":"${{ steps.resume.outputs.instance_id || env.NEO4J_AURA_INSTANCE_ID }}","short":true},{"title":"Action","value":"configuration_missing","short":true}]
+          # The guard runs every 30 minutes via cron; missing secrets don't
+          # self-heal on that timescale, so dedup across a working day so the
+          # channel isn't drowned in identical "you forgot the secrets" pings.
+          dedup_key: neo4j-aura-resume-config-missing
+          dedup_window_minutes: 720
+
+      - name: Fail workflow when resume guard failed
+        # Schedules: missing credentials are a soft skip (warning only). Manual
+        # dispatch: missing credentials surface as a hard failure so the
+        # operator sees the misconfiguration immediately.
+        if: ${{ steps.resume.outcome != 'success' && (steps.resume.outputs.action != 'configuration_missing' || github.event_name == 'workflow_dispatch') }}
+        run: exit 1

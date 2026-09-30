@@ -1,0 +1,164 @@
+name: Post-Deploy Smoke Tests
+
+on:
+  workflow_run:
+    workflows: ["Production Deploy"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: production-post-deploy-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke-tests:
+    name: Production Smoke Tests
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success') ||
+      github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      PUBLIC_APP_URL: ${{ vars.PRODUCTION_APP_URL }}
+      PUBLIC_API_URL: ${{ vars.PRODUCTION_API_URL }}
+      # AWS / EC2 resolution. The EC2 security group only allows SSH from a
+      # fixed allowlist, so a GitHub-hosted runner cannot connect on port 22
+      # out of the box. resolve_ec2_target.sh discovers this runner's public
+      # IP and temporarily authorizes it (revoked in the always() teardown),
+      # mirroring the Production Deploy workflow. Without this, the internal
+      # SSH smoke step fails with "dial tcp …:22: i/o timeout".
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY || '' }}
+      EC2_HOST: ${{ secrets.EC2_HOST || '' }}
+      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID || vars.EC2_INSTANCE_ID || '' }}
+      EC2_INSTANCE_NAME: ${{ vars.EC2_INSTANCE_NAME || '' }}
+      EC2_AUTO_START: ${{ vars.EC2_AUTO_START || 'true' }}
+      EC2_TEMPORARY_SSH_INGRESS: ${{ vars.EC2_TEMPORARY_SSH_INGRESS || 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate required smoke-test secrets
+        env:
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for name in EC2_USER EC2_SSH_KEY; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+
+          # A host is reachable via a static EC2_HOST or by resolving an
+          # instance id / name through the AWS API in resolve_ec2_target.sh.
+          if [ -z "${EC2_HOST:-}" ] && [ -z "${EC2_INSTANCE_ID:-}" ] && [ -z "${EC2_INSTANCE_NAME:-}" ]; then
+            missing+=("EC2_HOST or EC2_INSTANCE_ID/EC2_INSTANCE_NAME")
+          fi
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing required production smoke-test secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Install AWS CLI
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' && env.AWS_SECRET_ACCESS_KEY != '' }}
+        # Pinned to v1.0.7 SHA per supply-chain hygiene. Tags are mutable; SHA
+        # pins prevent a repointed tag from injecting untrusted code.
+        uses: unfor19/install-aws-cli-action@e8b481e524a99f37fbd39fdc1dcb3341ab091367  # v1.0.7
+
+      - name: Resolve production EC2 target
+        id: ec2-target
+        # Resolves the host, temporarily authorizes this runner's IP on SSH,
+        # and waits for port 22 to accept connections. Records the temp ingress
+        # CIDR in GITHUB_ENV so the always() revoke step can tear it down.
+        run: scripts/ci/resolve_ec2_target.sh
+
+      - name: Run internal EC2 smoke tests
+        id: internal_smoke
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ steps.ec2-target.outputs.host || secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          command_timeout: 20m
+          script: |
+            set -euo pipefail
+
+            command -v docker >/dev/null
+            command -v curl >/dev/null
+
+            echo "=== Containers ==="
+            docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+
+            echo "=== Backend ready ==="
+            curl -fsS http://127.0.0.1:8010/ready >/dev/null
+
+            echo "=== Backend health ==="
+            curl -fsS http://127.0.0.1:8010/health >/dev/null
+
+            echo "=== In-container ready probe ==="
+            docker exec smart-tutor-backend curl -fsS http://127.0.0.1:8000/ready >/dev/null
+
+            echo "=== In-container metrics probe ==="
+            docker exec smart-tutor-backend curl -fsS http://127.0.0.1:8000/metrics >/dev/null
+
+      - name: Revoke temporary SSH ingress
+        if: always()
+        run: scripts/ci/revoke_ec2_ssh_ingress.sh
+
+      - name: Run external smoke tests
+        id: external_smoke
+        if: ${{ env.PUBLIC_APP_URL != '' || env.PUBLIC_API_URL != '' }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$PUBLIC_APP_URL" ]; then
+            curl -fsS --max-time 20 "$PUBLIC_APP_URL" >/dev/null
+          fi
+
+          if [ -n "$PUBLIC_API_URL" ]; then
+            curl -fsS --max-time 20 "$PUBLIC_API_URL/ready" >/dev/null
+          fi
+
+      - name: Smoke summary
+        if: always()
+        run: |
+          external_outcome="${{ steps.external_smoke.outcome }}"
+          if [ -z "${external_outcome}" ]; then
+            if [ -z "${PUBLIC_APP_URL}" ] && [ -z "${PUBLIC_API_URL}" ]; then
+              external_outcome="skipped: PRODUCTION_APP_URL and PRODUCTION_API_URL not configured"
+            else
+              external_outcome="skipped"
+            fi
+          fi
+
+          {
+            echo "## Post-Deploy Smoke Summary"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Trigger | \`${{ github.event_name }}\` |"
+            echo "| Internal EC2 smoke | \`${{ steps.internal_smoke.outcome }}\` |"
+            echo "| External smoke | \`${external_outcome}\` |"
+            echo "| Public app URL | \`${{ env.PUBLIC_APP_URL || 'not configured' }}\` |"
+            echo "| Public API URL | \`${{ env.PUBLIC_API_URL || 'not configured' }}\` |"
+            echo ""
+            echo "Executed checks:"
+            echo "- Localhost backend `/ready`"
+            echo "- Localhost backend `/health`"
+            echo "- In-container backend `/ready`"
+            echo "- In-container backend `/metrics`"
+            if [ -n "${PUBLIC_APP_URL}" ] || [ -n "${PUBLIC_API_URL}" ]; then
+              echo "- External public URL smoke checks"
+            else
+              echo "- External public URL smoke checks skipped because production URLs are not configured"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
